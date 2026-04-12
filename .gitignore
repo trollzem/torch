@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+signing/
+signed/
+*.mobileprovision
+*.p12
+*.pem
+.DS_Store

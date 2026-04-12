@@ -1,0 +1,3 @@
+pymobiledevice3>=9.9.0
+rumps>=0.4.0
+cryptography>=46.0.0
