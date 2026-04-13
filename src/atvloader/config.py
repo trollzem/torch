@@ -236,69 +236,137 @@ def _detect_ipa_platform(ipa_path: Path) -> tuple[str, str]:
     return "iOS", bundle_id
 
 
-def seed_ipas_from_project_dir() -> list[IPA]:
-    """Copy project-level ipas/ files into Application Support and return IPAs.
-
-    This runs on first app launch so the spike's YouTube/Streamer show up
-    as tracked apps without the user having to re-add them.
+def copy_project_ipas_into_runtime() -> None:
+    """Copy project-level ipas/*.ipa into the runtime Application Support
+    folder. Idempotent — skips files that are already present. Runs on
+    every startup, not just first run, so dropping a new IPA into the
+    project's ipas/ folder (for dev workflow) picks it up too.
     """
     if not paths.PROJECT_IPAS_DIR.exists():
-        return []
+        return
     paths.IPAS_DIR.mkdir(parents=True, exist_ok=True)
-
-    out: list[IPA] = []
     for src in sorted(paths.PROJECT_IPAS_DIR.glob("*.ipa")):
         dest = paths.IPAS_DIR / src.name
         if not dest.exists():
-            log.info("seeding IPA %s -> %s", src, dest)
+            log.info("copying project IPA %s -> %s", src, dest)
             shutil.copy2(src, dest)
-        try:
-            platform, bundle_id = _detect_ipa_platform(dest)
-        except Exception as e:  # noqa: BLE001
-            log.warning("failed to inspect %s: %s", dest, e)
+
+
+def _make_ipa_entry(ipa_file: Path, devices: list[Device]) -> IPA | None:
+    """Create a new IPA entry for a freshly discovered file.
+
+    Auto-targets every currently-known device. The refresh module will
+    filter by platform compatibility, so targeting an iPhone with a tvOS
+    IPA is a no-op (not an error).
+    """
+    try:
+        platform, bundle_id = _detect_ipa_platform(ipa_file)
+    except Exception as e:  # noqa: BLE001
+        log.warning("failed to inspect %s: %s", ipa_file, e)
+        return None
+    return IPA(
+        filename=ipa_file.name,
+        sha256=sha256_file(ipa_file),
+        original_bundle_id=bundle_id,
+        platform=platform,
+        added_at=_now_iso(),
+        target_devices=[d.pair_record_identifier for d in devices],
+    )
+
+
+def sync_ipas_folder(cfg: Config) -> bool:
+    """Reconcile cfg.ipas against what's actually in the runtime ipas/ folder.
+
+    - Any .ipa file in the folder that isn't tracked gets a new IPA entry.
+    - Any tracked IPA whose file has disappeared is removed from cfg.ipas
+      (the signed cache is left alone; the refresh module will notice
+      "missing source" if someone tries to refresh a deleted entry).
+
+    Returns True if anything changed.
+    """
+    paths.IPAS_DIR.mkdir(parents=True, exist_ok=True)
+    files_on_disk: dict[str, Path] = {
+        p.name: p for p in paths.IPAS_DIR.glob("*.ipa")
+    }
+    tracked: dict[str, IPA] = {i.filename: i for i in cfg.ipas}
+
+    changed = False
+
+    # Remove tracked IPAs whose source file is gone.
+    for name in list(tracked):
+        if name not in files_on_disk:
+            log.info("IPA %s no longer present on disk; untracking", name)
+            tracked.pop(name)
+            changed = True
+
+    # Add new files.
+    for name, path in files_on_disk.items():
+        if name in tracked:
             continue
-        out.append(
-            IPA(
-                filename=dest.name,
-                sha256=sha256_file(dest),
-                original_bundle_id=bundle_id,
-                platform=platform,
-                added_at=_now_iso(),
-            )
+        entry = _make_ipa_entry(path, cfg.devices)
+        if entry is None:
+            continue
+        log.info(
+            "discovered new IPA %s (platform=%s, bundle=%s)",
+            name,
+            entry.platform,
+            entry.original_bundle_id,
         )
-    return out
+        tracked[name] = entry
+        changed = True
+
+    if changed:
+        cfg.ipas = sorted(tracked.values(), key=lambda i: i.filename)
+    return changed
 
 
 def bootstrap() -> Config:
-    """Load config, or create + seed one from existing Mac state.
+    """Load config (or create a fresh one), seed devices / creds from
+    existing Mac state, sync the IPAs folder with what's on disk, and
+    return the resulting Config.
 
-    Called on every app launch. Idempotent. If config.json already exists,
-    we load it and return unchanged — seeding only runs on a truly empty
-    state (fresh install on a Mac that already has plumesign + pair records
-    set up from the spike, which is exactly the user's situation today).
+    Called on every app launch. Idempotent:
+      - If config.json exists, we load it.
+      - If it doesn't exist, we create a new one and seed apple_id +
+        devices from the plumesign + pymobiledevice3 state directories.
+      - Regardless of which path we took, we then sync_ipas_folder()
+        against the runtime ipas/ directory so that any IPA files
+        dropped in since the last run appear as tracked apps. This
+        also recovers if config.json lost entries for any reason.
+
+    We also copy project-level ipas/*.ipa into the runtime location on
+    every startup so the dev workflow (stash .ipa files in the repo,
+    run from source) keeps working without the user having to manually
+    copy files.
     """
     paths.ensure_dirs()
 
+    copy_project_ipas_into_runtime()
+
     if paths.CONFIG_FILE.exists():
-        return Config.load()
+        cfg = Config.load()
+    else:
+        log.info("no config found, creating new one")
+        cfg = Config()
 
-    log.info("no config found, bootstrapping from existing state")
-    cfg = Config()
-
+    # Seed / refresh the Apple ID email from plumesign state every run
+    # so a logout-from-CLI is reflected without the user having to
+    # edit config.json.
     plumesign_email = plumesign_is_logged_in()
     if plumesign_email:
-        log.info("detected plumesign session for %s", plumesign_email)
         cfg.apple_id_email = plumesign_email
 
-    cfg.devices = seed_devices_from_pair_records()
-    log.info("seeded %d device(s) from pair records", len(cfg.devices))
+    # Seed devices from pair records IF the config has no devices yet.
+    # On subsequent runs we leave the stored devices alone — their
+    # identifiers are stable, and the pymd3 reconciliation pass will
+    # update name / udid / device_class / product info at runtime.
+    if not cfg.devices:
+        cfg.devices = seed_devices_from_pair_records()
+        log.info("seeded %d device(s) from pair records", len(cfg.devices))
 
-    cfg.ipas = seed_ipas_from_project_dir()
-    log.info("seeded %d IPA(s) from project directory", len(cfg.ipas))
-
-    # Auto-target every seeded IPA at every seeded device.
-    for ipa in cfg.ipas:
-        ipa.target_devices = [d.pair_record_identifier for d in cfg.devices]
+    # Sync IPAs from the runtime folder every run.
+    if sync_ipas_folder(cfg):
+        log.info("IPAs folder changed; config updated")
 
     cfg.save()
     return cfg
