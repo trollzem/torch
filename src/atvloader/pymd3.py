@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -30,6 +31,12 @@ from . import paths
 from .config import Device
 
 log = logging.getLogger(__name__)
+
+# Default install timeout. The spike showed successful installs complete
+# in 20-30 seconds for 50 MB IPAs, so 180s leaves headroom for slow WiFi
+# while still catching hangs (e.g. installd waiting on a running app we
+# failed to terminate).
+_INSTALL_TIMEOUT = 180.0
 
 
 class Pymd3Error(Exception):
@@ -50,6 +57,11 @@ class InstallError(Pymd3Error):
 
 class LockdownError(Pymd3Error):
     """`pymobiledevice3 lockdown info` failed."""
+
+
+class DvtError(Pymd3Error):
+    """DVT (process control) subcommand failed. Usually non-fatal — the caller
+    can swallow this and continue if developer mode isn't enabled on the device."""
 
 
 # --- tunneld HTTP API --------------------------------------------------------
@@ -216,28 +228,150 @@ def reconcile_all(devices: list[Device]) -> list[Device]:
     return out
 
 
+# --- DVT process control (for pre-install kill) ------------------------------
+
+
+def get_pid_for_bundle(
+    tunnel_addr: str, tunnel_port: int, bundle_id: str
+) -> int | None:
+    """Return the PID of a running app via DVT, or None if not running.
+
+    Requires Developer Mode + Developer Disk Image on the target device.
+    Raises DvtError if the service is unreachable (typical on production
+    iPhones without Developer Mode). tvOS 26+ devices generally have this
+    working out of the box after the first tunneld connection.
+    """
+    result = _run_pymd3(
+        [
+            "developer",
+            "dvt",
+            "process-id-for-bundle-id",
+            "--rsd",
+            tunnel_addr,
+            str(tunnel_port),
+            bundle_id,
+        ],
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise DvtError(
+            f"process-id-for-bundle-id failed (exit={result.returncode}): "
+            f"{result.stderr[-400:]}"
+        )
+    # DVT prints either a bare integer PID or "None" (or similar) for
+    # not-running. Stdout may also be empty on some firmwares — in which
+    # case we assume the app isn't running.
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        return None
+    # Strip any "PID:" prefix or quotes DVT might add
+    for token in stdout.splitlines():
+        token = token.strip().strip('"')
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def kill_process(tunnel_addr: str, tunnel_port: int, pid: int) -> None:
+    """Kill a process by PID via DVT."""
+    result = _run_pymd3(
+        [
+            "developer",
+            "dvt",
+            "kill",
+            "--rsd",
+            tunnel_addr,
+            str(tunnel_port),
+            str(pid),
+        ],
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise DvtError(
+            f"dvt kill failed (exit={result.returncode}): "
+            f"{result.stderr[-400:]}"
+        )
+
+
+def terminate_bundle_if_running(
+    tunnel_addr: str, tunnel_port: int, bundle_id: str
+) -> bool:
+    """Best-effort pre-install kill of a running app. Returns True if a
+    running PID was found and killed, False otherwise.
+
+    Never raises — if DVT is unavailable or the kill fails, we log and
+    return False so the caller can decide whether to proceed anyway.
+    """
+    try:
+        pid = get_pid_for_bundle(tunnel_addr, tunnel_port, bundle_id)
+    except DvtError as e:
+        log.debug("DVT unavailable for %s: %s", bundle_id, e)
+        return False
+    if pid is None:
+        log.debug("bundle %s is not currently running", bundle_id)
+        return False
+    log.info("terminating running app %s (pid=%d) before install", bundle_id, pid)
+    try:
+        kill_process(tunnel_addr, tunnel_port, pid)
+    except DvtError as e:
+        log.warning("failed to kill %s pid=%d: %s", bundle_id, pid, e)
+        return False
+    # Give the device a moment for installd to release whatever lock it
+    # was holding on the bundle's on-disk files before we re-upload.
+    time.sleep(1.5)
+    return True
+
+
 # --- Install -----------------------------------------------------------------
 
 
-def install_ipa(tunnel_addr: str, tunnel_port: int, ipa_path: Path) -> None:
-    """Install a signed IPA through the given tunnel. Raises on any failure."""
+def install_ipa(
+    tunnel_addr: str,
+    tunnel_port: int,
+    ipa_path: Path,
+    *,
+    terminate_bundle_id: str | None = None,
+) -> None:
+    """Install a signed IPA through the given tunnel. Raises on any failure.
+
+    If `terminate_bundle_id` is provided, we first try to kill any running
+    instance of that bundle via DVT. This works around `installd` hanging
+    indefinitely when asked to replace a currently-running app (we hit this
+    with YouTube on tvOS 26.4 — `apps install` sits at 0% CPU waiting for
+    the frontmost app to exit, and the wait has no timeout on its own).
+
+    The pre-kill is best-effort; if DVT isn't available (no Developer Mode)
+    we still attempt the install, relying on the subprocess timeout to
+    surface the hang case instead of waiting forever.
+    """
     if not ipa_path.exists():
         raise InstallError(f"IPA not found: {ipa_path}")
+
+    if terminate_bundle_id:
+        terminate_bundle_if_running(tunnel_addr, tunnel_port, terminate_bundle_id)
 
     log.info(
         "installing %s via tunnel %s:%d", ipa_path.name, tunnel_addr, tunnel_port
     )
-    result = _run_pymd3(
-        [
-            "apps",
-            "install",
-            "--rsd",
-            tunnel_addr,
-            str(tunnel_port),
-            str(ipa_path),
-        ],
-        timeout=600,
-    )
+    try:
+        result = _run_pymd3(
+            [
+                "apps",
+                "install",
+                "--rsd",
+                tunnel_addr,
+                str(tunnel_port),
+                str(ipa_path),
+            ],
+            timeout=_INSTALL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise InstallError(
+            f"install timed out after {_INSTALL_TIMEOUT:.0f}s — the target app "
+            f"may be running on the device and DVT pre-kill did not succeed. "
+            f"Close the app on the device and retry."
+        ) from e
+
     if result.returncode != 0:
         tail = result.stderr[-800:] or result.stdout[-800:]
         raise InstallError(
