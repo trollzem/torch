@@ -1,3 +1,15 @@
+diff --git a/crates/plume_core/Cargo.toml b/crates/plume_core/Cargo.toml
+index eef87ed..b7e9995 100644
+--- a/crates/plume_core/Cargo.toml
++++ b/crates/plume_core/Cargo.toml
+@@ -48,6 +48,7 @@ p12-keystore = "0.2"      # p12 crate only supports legacy PKCS#12
+ apple-codesign = { git = "https://github.com/PlumeImpactor/plume-apple-platform-rs", rev = "428b42f", package = "apple-codesign", default-features = false }
+ omnisette = { git = "https://github.com/PlumeImpactor/omnisette", rev = "c5c4cf2", package = "omnisette", features = [
+     "remote-anisette-v3",
++    "aos-kit",
+ ] }
+ srp = "0.7.0-rc.1"
+ 
 diff --git a/crates/plume_core/src/developer/mod.rs b/crates/plume_core/src/developer/mod.rs
 index b68d1d9..e643f41 100644
 --- a/crates/plume_core/src/developer/mod.rs

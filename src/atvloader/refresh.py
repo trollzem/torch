@@ -42,6 +42,13 @@ _refresh_lock = threading.Lock()
 
 MAX_CONSECUTIVE_FAILURES = 3
 
+# Free Apple ID per-device capacity. Apple limits a free Personal Team
+# certificate to 3 simultaneously-installed apps on a single device; when
+# a 4th is installed, the oldest gets silently invalidated (developer
+# apps get "untrusted" on the device and stop launching). We refuse to
+# install the 4th rather than trip this invisible edge.
+FREE_TIER_DEVICE_APP_CAP = 3
+
 
 class RefreshAborted(Exception):
     """Raised when a refresh stops for a reason that applies to the whole run
@@ -106,6 +113,37 @@ def is_frozen(ipa: IPA) -> bool:
     """True if the IPA has hit the retry cap and should be skipped until
     the user intervenes."""
     return ipa.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+
+
+def count_active_apps_on_device(cfg: Config, device: Device) -> int:
+    """How many tracked IPAs are currently targeted at (and platform-
+    compatible with) the given device.
+
+    This approximates "apps the free Personal Team cert is signing on
+    this device" — the number Apple caps at FREE_TIER_DEVICE_APP_CAP.
+    Counts only IPAs that are compatible with the device's platform.
+    """
+    return sum(
+        1
+        for ipa in cfg.ipas
+        if device.pair_record_identifier in ipa.target_devices
+        and is_compatible(ipa.platform, device.device_class)
+    )
+
+
+def device_has_room(cfg: Config, device: Device, *, including: IPA) -> bool:
+    """True if installing `including` on `device` would stay within the
+    free-tier 3-app cap. If `including` is already tracked for this
+    device, a refresh of it doesn't count toward the cap (we're not
+    adding a new slot).
+    """
+    existing = count_active_apps_on_device(cfg, device)
+    already_tracked = (
+        device.pair_record_identifier in including.target_devices
+        and is_compatible(including.platform, device.device_class)
+    )
+    projected = existing if already_tracked else existing + 1
+    return projected <= FREE_TIER_DEVICE_APP_CAP
 
 
 # --- Device reconciliation ---------------------------------------------------
@@ -224,6 +262,37 @@ def refresh_one(
         _record_failure(ipa, "no-targets", "no compatible target devices")
         emit("no compatible targets; skipping")
         return False
+
+    # Enforce the free Apple ID 3-apps-per-device cap. This is separate
+    # from the 10-app-IDs-per-week team-level limit — it's a per-device
+    # ceiling on simultaneously-trusted free-signed apps. Filter out any
+    # device that would go over 3 if we installed this IPA. If ALL
+    # targets get filtered out, treat it as a soft failure with a
+    # distinct status so the user knows to remove something rather than
+    # chasing a different problem.
+    over_cap: list[str] = []
+    within_cap: list[Device] = []
+    for d in compatible:
+        if device_has_room(cfg, d, including=ipa):
+            within_cap.append(d)
+        else:
+            over_cap.append(d.name)
+
+    if over_cap and not within_cap:
+        msg = (
+            f"device {over_cap[0]} already has "
+            f"{FREE_TIER_DEVICE_APP_CAP} apps (free-tier cap); "
+            f"remove one from tracking before adding this IPA"
+        )
+        _record_failure(ipa, "device-full", msg)
+        emit(msg)
+        return False
+    if over_cap:
+        emit(
+            f"skipping {', '.join(over_cap)} (would exceed 3-app cap); "
+            f"refreshing on {', '.join(d.name for d in within_cap)}"
+        )
+    compatible = within_cap
 
     source = _source_ipa_path(ipa)
     if not source.exists():

@@ -382,6 +382,43 @@ def _rezip_staging_to_ipa(stage_dir: Path, output_ipa: Path) -> None:
         )
 
 
+def _verify_signed_bundle(stage_dir: Path) -> None:
+    """Run `codesign --verify --deep --strict` on the signed .app in
+    staging before we re-archive it into the output IPA.
+
+    Defensive gate: plumesign's sign step occasionally produces malformed
+    bundles (v2.2.3 had that happen to us once — the binary lacked an
+    LC_CODE_SIGNATURE slot because the staging-scrape workaround was
+    disabled in an early iteration). If the bundle is broken we'd rather
+    fail loudly here than ship an unsigned IPA to the device and hit a
+    cryptic installd error minutes later.
+
+    Uses `codesign` from macOS's built-in Security framework, not the
+    Rust apple-codesign library — the system binary has the authoritative
+    verification logic Apple's own installd uses.
+    """
+    payload = stage_dir / "Payload"
+    app_dirs = [p for p in payload.iterdir() if p.is_dir() and p.suffix == ".app"]
+    if not app_dirs:
+        raise PlumesignSignError(
+            f"staging dir has no .app inside Payload: {stage_dir}"
+        )
+    app = app_dirs[0]
+    log.info("verifying code signature on %s", app.name)
+    result = subprocess.run(
+        ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        combined = (result.stderr or result.stdout or "").strip()
+        raise PlumesignSignError(
+            f"codesign verification failed for {app.name}:\n{combined[-800:]}"
+        )
+    log.debug("codesign verify ok: %s", (result.stderr or result.stdout).strip())
+
+
 def sign_ipa(
     ipa_path: Path,
     output_ipa: Path,
@@ -445,6 +482,11 @@ def sign_ipa(
 
     log.info("using plumesign staging dir: %s", stage_dir)
     try:
+        # Defensive gate: validate the signature on the .app in staging
+        # BEFORE we re-archive it. If the sign step produced garbage
+        # (which has happened historically with plumesign v2.2.3), we
+        # want to fail here rather than ship a broken IPA downstream.
+        _verify_signed_bundle(stage_dir)
         _rezip_staging_to_ipa(stage_dir, output_ipa)
     finally:
         # Clean up staging now that we have the IPA. Swallow errors;

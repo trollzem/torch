@@ -6,3 +6,6 @@ signed/
 *.p12
 *.pem
 .DS_Store
+# iOS YouTube IPA is over GitHub's 100MB single-file limit. Runtime
+# copy lives at ~/Library/Application Support/ATVLoader/ipas/ anyway.
+ipas/YouTube-iOS.ipa

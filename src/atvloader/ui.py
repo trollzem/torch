@@ -347,6 +347,14 @@ class ATVLoaderApp(rumps.App):
                     suffix += f" · {device.product_type}"
                 if device.product_version:
                     suffix += f" {device.product_version}"
+                # Free-tier per-device app cap display. 3 is Apple's
+                # limit for Personal Team signed apps; we warn with ⚠️
+                # at the cap so the user sees why a refresh might start
+                # skipping the device.
+                active = refresh.count_active_apps_on_device(self.cfg, device)
+                cap = refresh.FREE_TIER_DEVICE_APP_CAP
+                cap_marker = " ⚠️" if active >= cap else ""
+                suffix += f" · {active}/{cap} apps{cap_marker}"
                 label = f"{device.name}{suffix}"
                 devices_item.add(rumps.MenuItem(label, callback=None))
         else:
