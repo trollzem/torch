@@ -167,7 +167,17 @@ if [ ! -f "$HOME/.config/PlumeImpactor/accounts.json" ]; then
     log "sent to a trusted device. This is a one-time step; the session"
     log "is cached and subsequent signs don't re-prompt."
     echo
-    ./bin/plumesign account login
+    # When this script is run via `curl | bash`, bash inherits stdin
+    # from the pipe, which means plumesign's interactive prompts
+    # (Enter Apple ID email / password / 2FA code) all read EOF
+    # immediately instead of waiting for the user. Redirecting from
+    # /dev/tty points plumesign at the controlling terminal directly
+    # so the prompts actually work.
+    if [ ! -t 0 ] && [ -r /dev/tty ]; then
+        ./bin/plumesign account login < /dev/tty
+    else
+        ./bin/plumesign account login
+    fi
 else
     email=$("$VENV_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("selected_account","(unknown)"))' < "$HOME/.config/PlumeImpactor/accounts.json" 2>/dev/null || echo "(unknown)")
     log "plumesign session already exists for $email"
