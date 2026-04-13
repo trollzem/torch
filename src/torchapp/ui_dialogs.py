@@ -87,3 +87,33 @@ def prompt_2fa_code() -> str | None:
         return None
     code = "".join(c for c in response.text if c.isdigit())
     return code or None
+
+
+def prompt_pairing_pin(device_name: str) -> str | None:
+    """Show a modal asking for the Apple TV pairing PIN. Returns None on cancel.
+
+    pymobiledevice3 only prompts for a PIN when the peer is an Apple TV;
+    iPhone/iPad pairing uses the device's own Trust dialog and never
+    reaches this codepath. The PIN is a 6-digit code shown on the Apple
+    TV pairing screen the user just opened.
+
+    Strips whitespace and non-digit characters so the user can paste
+    "123 456" or "123-456" if pymobiledevice3's display formats it that
+    way on-device.
+    """
+    window = rumps.Window(
+        message=(
+            f"Apple TV {device_name!r} is showing a 6-digit pairing "
+            f"code on screen.\n\nEnter it below."
+        ),
+        title="Torch — Pair Apple TV",
+        default_text="",
+        ok="Pair",
+        cancel="Cancel",
+        dimensions=(120, 24),
+    )
+    response = window.run()
+    if response.clicked != 1:
+        return None
+    code = "".join(c for c in response.text if c.isdigit())
+    return code or None

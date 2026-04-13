@@ -49,7 +49,14 @@ def _hide_dock_icon() -> None:
 
 def _setup_logging() -> None:
     paths.ensure_dirs()
-    handler = logging.FileHandler(paths.LOG_FILE)
+    # Explicit UTF-8 encoding. Under launchd the process's locale
+    # defaults to ASCII (LANG is unset in the LaunchAgent plist), so
+    # FileHandler defaults to ASCII — which silently drops any log
+    # message containing a non-ASCII character (e.g. the → arrow in
+    # pair_helper's instruction strings). That made pairing state
+    # transitions disappear from the log mid-flow. Forcing UTF-8 here
+    # fixes the handler for every downstream logger.
+    handler = logging.FileHandler(paths.LOG_FILE, encoding="utf-8")
     handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     )

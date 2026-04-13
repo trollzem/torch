@@ -27,8 +27,8 @@ device added).
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,8 +42,22 @@ except ImportError:  # pragma: no cover
     AppHelper = None  # type: ignore[assignment]
 
 from . import config as cfgmod
-from . import icons, keychain, pairing, paths, plumesign, pymd3, refresh, ui_dialogs
+from . import (
+    icons,
+    keychain,
+    pairing,
+    paths,
+    plumesign,
+    pymd3,
+    refresh,
+    ui_dialogs,
+)
 from .config import Config
+
+# pair_helper is NEVER imported here. It imports pymobiledevice3 at
+# top level, and pymobiledevice3 is excluded from the py2app bundle
+# (exclude saves ~150 MB). We run pair_helper as a subprocess under
+# Homebrew's python3.14 — see _pairing_worker.
 
 log = logging.getLogger(__name__)
 
@@ -462,7 +476,7 @@ class TorchApp(rumps.App):
         devices_item.add(rumps.separator)
         devices_item.add(
             rumps.MenuItem(
-                "Add Apple TV (pair via Terminal)…",
+                "Add Apple TV…",
                 callback=self.on_add_device_tv,
             )
         )
@@ -761,7 +775,7 @@ class TorchApp(rumps.App):
     # --- device onboarding ---------------------------------------------------
 
     def on_add_device_tv(self, _sender: object) -> None:
-        self._start_pairing_handoff(device_kind="tvOS")
+        self._start_pairing_in_ui()
 
     def on_add_device_ios(self, _sender: object) -> None:
         """Auto-detect a USB-trusted iPhone/iPad via tunneld and add it.
@@ -892,87 +906,235 @@ class TorchApp(rumps.App):
                 f"added. They'll be refreshed on the next cycle.",
             )
 
-    def _start_pairing_handoff(self, *, device_kind: str) -> None:
-        """Hand the pairing flow off to a Terminal window.
+    def _start_pairing_in_ui(self) -> None:
+        """Native-UI Apple TV pairing flow.
 
-        Runs entirely on the main thread (no worker, no cross-thread
-        modals). We open Terminal.app with the pairing command pre-
-        filled, then start a rumps.Timer that polls
-        ~/.pymobiledevice3/ every 3 seconds for up to 3 minutes
-        looking for a new remote_*.plist file. When one appears,
-        we reconcile it against tunneld, register with Apple, and
-        update the menu.
+        Replaces the previous osascript Terminal handoff. Spawns
+        pair_helper.py as a subprocess under Homebrew python3.14
+        (which has pymobiledevice3 installed; our py2app bundle
+        deliberately excludes it), captures `STATE:` lines from
+        stdout, and when pair_helper emits `STATE: awaiting_pin`
+        we marshal a rumps.Window PIN dialog to the main thread via
+        _run_on_main_and_wait and write the user's input back to the
+        subprocess stdin. See _pairing_worker for the protocol.
 
-        This is deliberately less fancy than a native modal flow
-        because rumps + worker threads + Cocoa modals is a footgun
-        that crashed the app the first time we tried it.
+        The historical CLAUDE.md warning about "rumps + worker threads
+        + Cocoa modals is a footgun" applies to any bug in this flow;
+        the `_run_on_main_and_wait` helper at ui.py:70 is the only
+        sanctioned way to marshal modals from a worker, and it's
+        already proven by the Apple ID login flow (Phase 3).
+
+        We keep the existing pair-record polling timer as a belt-
+        and-suspenders: pymobiledevice3 writes the pair record to
+        disk on success, and the poller picks it up and fires the
+        reconcile → register → config-update chain exactly as before.
+        The worker stops the timer early (via _stop_pairing_timer_async)
+        when it hits a terminal error state, so "no device" / "error"
+        / "cancel" don't fire a spurious "Pairing timed out" 3 minutes
+        later. The success state (STATE: pairing_complete) leaves the
+        timer running so the pair-record file is still picked up.
         """
-        if device_kind == "tvOS":
-            msg = (
-                "On your Apple TV, go to:\n\n"
-                "Settings → General → Remotes and Devices → "
-                "Remote App and Devices\n\n"
-                "Leave that screen open, then click OK. A Terminal "
-                "window will open to collect the 6-digit PIN."
-            )
-        else:
-            msg = (
-                "On your iPhone or iPad (iOS 17+), go to:\n\n"
-                "Settings → Privacy & Security → Developer Mode → "
-                "Pair Device\n\n"
-                "Leave that screen open, then click OK. A Terminal "
-                "window will open to collect the 6-digit PIN."
-            )
-
+        msg = (
+            "On your Apple TV, go to:\n\n"
+            "Settings → General → Remotes and Devices → "
+            "Remote App and Devices\n\n"
+            "Leave that screen open, then click OK. Torch will find "
+            "the Apple TV on the network and prompt you for the "
+            "6-digit code the device shows."
+        )
         if rumps.alert(
-            title="Add device", message=msg, ok="OK", cancel="Cancel"
+            title="Add Apple TV", message=msg, ok="OK", cancel="Cancel"
         ) != 1:
             return
 
-        # Record the set of pair records present RIGHT NOW so we can
-        # detect which one is new after the user finishes in Terminal.
+        # Record the set of pair records present RIGHT NOW so the
+        # fallback poller can detect the new one after pairing
+        # succeeds.
         self._pairing_baseline: set[str] = {
             p.stem.removeprefix("remote_")
             for p in paths.PYMD3_PAIR_RECORDS_DIR.glob("remote_*.plist")
         } if paths.PYMD3_PAIR_RECORDS_DIR.exists() else set()
 
-        # Open Terminal running the pairing command. Using osascript so
-        # Terminal.app is brought to the foreground cleanly.
-        #
-        # We run `python3 -m torchapp.pair_helper` instead of the bare
-        # `pymobiledevice3 remote pair` CLI because the latter shows
-        # one menu row per (device, interface) pair — 6-8 visually-
-        # identical entries for a single Apple TV with IPv4 + IPv6 ULA
-        # + link-local. pair_helper deduplicates by identifier and
-        # prefers the IPv4 address, so the user goes straight to the
-        # PIN prompt with no menu.
-        #
-        # Absolute paths for both the venv Python AND the repo root
-        # are required: the Terminal window inherits the user's
-        # default shell PATH / cwd, not the LaunchAgent's, so bare
-        # commands or relative paths resolve incorrectly.
-        venv_python = str(Path(sys.executable))
-        repo_root = str(paths.PROJECT_ROOT)
-        script = (
-            'tell application "Terminal" to activate\n'
-            'tell application "Terminal" to do script '
-            f'"cd \'{repo_root}\' && '
-            f'PYTHONPATH=src \'{venv_python}\' -m torchapp.pair_helper; '
-            'echo; echo \\"Pairing finished. You can close this window.\\""'
-        )
-        subprocess.run(["osascript", "-e", script])
+        threading.Thread(
+            target=self._pairing_worker,
+            daemon=True,
+            name="torch-pairing",
+        ).start()
 
-        rumps.notification(
-            "Torch",
-            "Pairing in progress",
-            "Enter the 6-digit code in the Terminal window that just "
-            "opened. I'll pick up the new device automatically.",
-        )
-
-        # Poll for a new pair record every 3 seconds for up to 3 minutes.
+        # Belt-and-suspenders: same pair-record polling as before.
+        # If the worker's own success notification path has a bug,
+        # this still completes the pairing when pymobiledevice3
+        # writes the plist.
         self._pairing_deadline = time.monotonic() + 180
         self._pairing_timer = rumps.Timer(self._poll_for_new_pair_record, 3.0)
         self._pairing_timer.start()
+
+    def _pairing_worker(self) -> None:
+        """Worker thread — spawns pair_helper.py as a subprocess under
+        Homebrew's python3.14 (which has pymobiledevice3 installed),
+        streams its `STATE:` lines from stdout, and feeds the PIN back
+        via stdin through a main-thread rumps.Window dialog.
+
+        Why subprocess: pair_helper imports pymobiledevice3 at module
+        load. The py2app bundle excludes pymobiledevice3 (the
+        transitive deps would bloat the bundle 5x), so importing
+        pair_helper from this thread inside the bundle would raise
+        ModuleNotFoundError. Running it under Homebrew python3.14
+        sidesteps the exclude by using a completely separate Python
+        environment that still has the library.
+
+        Protocol (pair_helper --state-markers):
+          stdout lines starting with `STATE: ` are state transitions.
+          STATE: searching         -> bonjour scan in progress
+          STATE: no_device: <msg>  -> no device in pairing mode (exit 2)
+          STATE: awaiting_pin      -> write PIN + newline to stdin
+          STATE: pairing_complete  -> success (exit 0)
+          STATE: error: <msg>      -> failure (exit 1)
+        """
+        python_bin = shutil.which("python3.14") or (
+            "/opt/homebrew/opt/python@3.14/bin/python3.14"
+        )
+        # pair_helper.py lives next to this file. Inside the bundle
+        # that's /Applications/Torch.app/Contents/Resources/lib/
+        # python3.14/torchapp/pair_helper.py; in dev mode, it's the
+        # source file at src/torchapp/pair_helper.py.
+        pair_helper_script = str(
+            Path(__file__).resolve().parent / "pair_helper.py"
+        )
+
+        if not Path(python_bin).exists():
+            self._notify_async(
+                "Torch",
+                "Pairing requires Homebrew python@3.14",
+                "Run `brew install python@3.14` and try again.",
+            )
+            return
+
+        try:
+            proc = subprocess.Popen(
+                [python_bin, pair_helper_script, "--state-markers"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                # Explicit UTF-8 encoding. Under launchd the process's
+                # locale defaults to ASCII (LANG is unset in the plist),
+                # so text=True without encoding chokes on any non-ASCII
+                # byte — e.g. the `→` arrow in pair_helper's
+                # "Settings → General → …" instructions.
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,  # line-buffered so STATE: lines arrive immediately
+            )
+        except OSError as e:
+            log.exception("could not start pair_helper subprocess")
+            self._notify_async(
+                "Torch", "Pairing failed",
+                f"Could not start pair helper: {e}",
+            )
+            return
+
+        log.info(
+            "spawned pair_helper subprocess pid=%s python=%s script=%s",
+            proc.pid, python_bin, pair_helper_script,
+        )
+        assert proc.stdout is not None
+        assert proc.stdin is not None
+        cancelled = False
+        line_count = 0
+        reached_terminal_state = False
+        try:
+            for raw_line in proc.stdout:
+                line_count += 1
+                line = raw_line.rstrip()
+                log.info("pair_helper[%d]: %r", line_count, line)
+                if not line.startswith("STATE: "):
+                    continue
+                state = line[len("STATE: "):]
+                if state.startswith("awaiting_pin"):
+                    pin = _run_on_main_and_wait(
+                        ui_dialogs.prompt_pairing_pin, "the Apple TV"
+                    )
+                    if not pin:
+                        log.info("pairing cancelled at PIN prompt")
+                        cancelled = True
+                        reached_terminal_state = True
+                        self._stop_pairing_timer_async()
+                        proc.kill()
+                        break
+                    proc.stdin.write(f"{pin}\n")
+                    proc.stdin.flush()
+                elif state.startswith("no_device"):
+                    msg = state.split(":", 1)[1].strip() if ":" in state else state
+                    reached_terminal_state = True
+                    self._stop_pairing_timer_async()
+                    self._notify_async(
+                        "Torch", "No Apple TV in pairing mode", msg[:180]
+                    )
+                elif state.startswith("pairing_complete"):
+                    reached_terminal_state = True
+                    # Don't stop the timer here — we want its
+                    # polling loop to discover the newly-written
+                    # pair record and kick off reconcile. If the
+                    # worker has already stopped the timer, the
+                    # notification below covers the UX.
+                    self._notify_async(
+                        "Torch",
+                        "Pairing complete",
+                        "The Apple TV is paired. Finalizing…",
+                    )
+                elif state.startswith("error"):
+                    msg = state.split(":", 1)[1].strip() if ":" in state else state
+                    reached_terminal_state = True
+                    self._stop_pairing_timer_async()
+                    self._notify_async(
+                        "Torch", "Pairing failed", msg[:180]
+                    )
+
+            log.info("pair_helper stdout loop ended after %d lines", line_count)
+            rc = proc.wait(timeout=5)
+            log.info("pair_helper exited with %s", rc)
+        except subprocess.TimeoutExpired:
+            log.warning("pair_helper did not exit after close; killing")
+            proc.kill()
+            if not reached_terminal_state:
+                self._stop_pairing_timer_async()
+                self._notify_async(
+                    "Torch", "Pairing timed out",
+                    "pair_helper did not exit cleanly.",
+                )
+        except Exception as e:  # noqa: BLE001
+            log.exception("pair_helper subprocess IO failed")
+            if proc.poll() is None:
+                proc.kill()
+            if not cancelled and not reached_terminal_state:
+                self._stop_pairing_timer_async()
+                self._notify_async(
+                    "Torch", "Pairing failed", str(e)[:180]
+                )
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _stop_pairing_timer_async(self) -> None:
+        """Main-thread-safe shutdown of the pair-record polling timer.
+
+        Called from the worker thread when it reaches a terminal state
+        (no_device, error, cancel) so the polling timer doesn't also
+        fire a "timed out" notification later. The success path
+        (STATE: pairing_complete) deliberately leaves the timer
+        running so it can detect the pair record file, pick up the
+        new device, and kick off _post_pair_reconcile_worker.
+        """
+        def _stop() -> None:
+            timer = getattr(self, "_pairing_timer", None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        _on_main_thread(_stop)
 
     def _poll_for_new_pair_record(self, _timer: object) -> None:
         """rumps.Timer callback — main thread. Checks for a new pair record."""
