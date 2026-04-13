@@ -106,7 +106,10 @@ cd "$TARGET_DIR"
 # ---------------------------------------------------------------------------
 
 log "Installing Python packages (rumps, keyring, pexpect, pyobjc, pymobiledevice3)"
-python3 -m pip install --break-system-packages --quiet --upgrade pip
+# NOTE: we deliberately do NOT `pip install --upgrade pip` here, because
+# Homebrew-installed pip has no RECORD file and pip can't uninstall it
+# to perform an upgrade ("Cannot uninstall pip X.Y: no RECORD file").
+# Homebrew already ships a current-enough pip for our needs.
 python3 -m pip install --break-system-packages --quiet -r requirements.txt
 python3 -m pip install --break-system-packages --quiet pymobiledevice3
 
