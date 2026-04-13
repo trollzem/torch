@@ -2,10 +2,12 @@ __pycache__/
 *.pyc
 signing/
 signed/
+ipas/
 *.mobileprovision
 *.p12
 *.pem
 .DS_Store
-# iOS YouTube IPA is over GitHub's 100MB single-file limit. Runtime
-# copy lives at ~/Library/Application Support/ATVLoader/ipas/ anyway.
-ipas/YouTube-iOS.ipa
+
+# Local engineering notes — stays on disk for development but never
+# ships to the public repo. Documented at the top of the file itself.
+CLAUDE.md

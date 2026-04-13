@@ -155,7 +155,7 @@ Torch is a thin Python menubar app (~3,500 lines) that orchestrates two external
 
 The orchestration (refresh scheduler, menubar UI, config management, device reconciliation, certificate rotation detection, pair record backup) is all in `src/torchapp/`.
 
-**For the full technical deep-dive**, including the load-bearing discoveries about free-tier tvOS provisioning, see [CLAUDE.md](CLAUDE.md).
+Every file is small, well-commented, and designed to be read top-to-bottom. Start at `src/torchapp/__main__.py` and follow the imports.
 
 ---
 
@@ -204,7 +204,7 @@ Apple does not officially document most of these limits. They're reverse-enginee
 - **Jailbreak anything.** Torch uses Apple's official free developer provisioning. If Apple lets Xcode do it, Torch does it the same way.
 - **Bypass code signing.** Every IPA is signed by Apple's CA via a real developer certificate issued to your Apple ID. The same way Xcode does it for personal development.
 - **Install apps from the App Store.** Torch takes IPAs you already have and signs them for your own devices.
-- **JIT for emulators on tvOS 26.** As of April 2026, Apple's TXM (Trusted Execution Monitor) on A15+ chips blocks the `CS_DEBUGGED` JIT trick, so apps like iCube (the tvOS Dolphin fork) run in interpreter mode only. This is an Apple-side restriction that no sideloader can work around today. Torch will ship JIT attach the moment a public bypass exists — see CLAUDE.md "Dead ends".
+- **JIT for emulators on tvOS 26.** Apple's TXM (Trusted Execution Monitor) on A15+ chips blocks the `CS_DEBUGGED` JIT trick, so apps like iCube (the tvOS Dolphin fork) run in interpreter mode only. This is an Apple-side restriction that no sideloader can work around today. Torch will ship JIT attach the moment a public bypass exists.
 - **Tweak injection.** Torch signs IPAs as-is. Bring your own pre-tweaked IPAs (YouTube Plus, uYouEnhanced, iCube, etc.).
 
 ---
