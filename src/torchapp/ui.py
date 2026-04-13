@@ -42,7 +42,7 @@ except ImportError:  # pragma: no cover
     AppHelper = None  # type: ignore[assignment]
 
 from . import config as cfgmod
-from . import icons, pairing, paths, plumesign, pymd3, refresh
+from . import icons, keychain, pairing, paths, plumesign, pymd3, refresh, ui_dialogs
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -335,6 +335,19 @@ class TorchApp(rumps.App):
             return "❌ No developer cert — re-login required"
         return f"Cert: {label}"
 
+    def _apple_id_summary(self) -> str:
+        """Return the Apple ID status line for the menu header.
+
+        Read directly from plumesign's on-disk accounts.json each time
+        (cfgmod.plumesign_is_logged_in) so a login that happens while
+        the menubar is running reflects on the next menu rebuild without
+        a restart.
+        """
+        email = cfgmod.plumesign_is_logged_in()
+        if not email:
+            return "⚠️ Apple ID: not logged in — click to log in"
+        return f"Apple ID: {email} — click to re-login"
+
     def _build_menu(self) -> None:
         self.menu.clear()
 
@@ -343,6 +356,11 @@ class TorchApp(rumps.App):
         cert_line = self._cert_summary()
         if cert_line:
             self.menu.add(rumps.MenuItem(cert_line, callback=None))
+        self.menu.add(
+            rumps.MenuItem(
+                self._apple_id_summary(), callback=self.on_apple_id_login
+            )
+        )
         self.menu.add(rumps.separator)
 
         # Apps submenu — each IPA is a parent item with a sub-menu
@@ -653,6 +671,92 @@ class TorchApp(rumps.App):
             "Drop .ipa files into the folder that just opened, then click "
             "'Refresh Now' to pick them up.",
         )
+
+    # --- Apple ID login ------------------------------------------------------
+
+    def on_apple_id_login(self, _sender: object) -> None:
+        """Menu callback — start the Apple ID login flow in a worker thread.
+
+        Main-thread callback (menu click). If we're already logged in,
+        ask for confirmation before overwriting the existing plumesign
+        session. Then spawn a worker that drives the three modal dialogs
+        via _run_on_main_and_wait, marshalling each prompt back to the
+        main thread.
+        """
+        existing = cfgmod.plumesign_is_logged_in()
+        if existing:
+            if rumps.alert(
+                title="Log in again?",
+                message=(
+                    f"Currently signed in as {existing}.\n\n"
+                    f"Logging in again will replace the existing "
+                    f"plumesign session — useful if the session expired "
+                    f"or you want to switch Apple IDs."
+                ),
+                ok="Continue",
+                cancel="Cancel",
+            ) != 1:
+                return
+
+        threading.Thread(
+            target=self._apple_id_login_worker,
+            daemon=True,
+        ).start()
+
+    def _apple_id_login_worker(self) -> None:
+        """Worker thread — collect credentials via main-thread dialogs and
+        call plumesign.login.
+
+        Every UI touch goes through _run_on_main_and_wait (for modals
+        that need a return value) or _notify_async / _rebuild_async
+        (for fire-and-forget main-thread work). Never call rumps APIs
+        from this thread directly — that was the footgun documented
+        in CLAUDE.md (rumps is Cocoa-main-thread-only).
+        """
+        try:
+            email = _run_on_main_and_wait(ui_dialogs.prompt_apple_id_email)
+            if not email:
+                log.info("apple id login cancelled at email prompt")
+                return
+
+            password = _run_on_main_and_wait(ui_dialogs.prompt_apple_id_password)
+            if not password:
+                log.info("apple id login cancelled at password prompt")
+                return
+
+            def tfa_callback() -> str:
+                code = _run_on_main_and_wait(ui_dialogs.prompt_2fa_code)
+                if not code:
+                    raise plumesign.PlumesignAuthError(
+                        "2FA code entry cancelled"
+                    )
+                return code
+
+            log.info("starting plumesign login for %s", email)
+            plumesign.login(email, password, tfa_callback=tfa_callback)
+
+            # Store the password in the keychain so future session-
+            # expired recovery flows (not yet implemented but planned)
+            # can silently re-auth without asking the user again.
+            try:
+                keychain.set_password(email, password)
+            except Exception as e:  # noqa: BLE001
+                log.warning("keychain store failed (non-fatal): %s", e)
+
+            self._notify_async(
+                "Torch", "Signed in", f"Logged in as {email}."
+            )
+            self._rebuild_async()
+        except plumesign.PlumesignAuthError as e:
+            log.warning("apple id login failed: %s", e)
+            self._notify_async(
+                "Torch", "Login failed", str(e)[:180] or "Authentication error"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("unexpected error during apple id login")
+            self._notify_async(
+                "Torch", "Login failed", f"Unexpected error: {e!s}"[:180]
+            )
 
     # --- device onboarding ---------------------------------------------------
 

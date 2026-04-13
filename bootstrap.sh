@@ -14,10 +14,9 @@
 #   3. Clones Torch to ~/torch (or uses an existing checkout).
 #   4. Installs Python dependencies (rumps, keyring, pexpect, pyobjc, pymobiledevice3).
 #   5. Verifies the bundled patched plumesign binary is present (or rebuilds from source).
-#   6. Prompts for Apple ID login (one-time, interactive — email + password + 2FA).
-#   7. Installs the launchd services (LaunchDaemon for tunneld, LaunchAgent for menubar).
+#   6. Installs the launchd services (LaunchDaemon for tunneld, LaunchAgent for menubar).
 #      This is the single sudo moment — macOS's native admin dialog will ask once.
-#   8. Tells you how to pair your first device.
+#   7. Tells you how to log in and pair your first device from the menubar.
 #
 # The script is idempotent — running it again on an existing install does a
 # `git pull` and re-bootstraps everything, skipping steps that are already done.
@@ -167,51 +166,16 @@ log "Patched plumesign binary is present"
 # directory.
 mkdir -p "$HOME/.pymobiledevice3"
 
-# ---------------------------------------------------------------------------
-#  Step 7: Apple ID login (interactive, one-time)
-# ---------------------------------------------------------------------------
-
-if [ ! -f "$HOME/.config/PlumeImpactor/accounts.json" ]; then
-    log "Logging in to your Apple ID"
-    log "You'll enter your Apple ID email, then plumesign will prompt"
-    log "for your password and a 2FA code sent to a trusted device."
-    log "One-time step — the session is cached and subsequent signs"
-    log "don't re-prompt."
-    echo
-
-    # plumesign's LoginArgs struct has `arg_required_else_help = true`
-    # at the clap level, which means `plumesign account login` with no
-    # flags prints help and exits BEFORE the handler that would otherwise
-    # interactively prompt for email. We must pass -u explicitly.
-    #
-    # Bash reads the email from /dev/tty directly so it works under
-    # `curl | bash` (where the script's own stdin is the pipe, not a
-    # terminal). Then we pass it to plumesign with -u and redirect
-    # plumesign's own stdin from /dev/tty so its password + 2FA prompts
-    # can read the user's terminal.
-    APPLE_ID_EMAIL=""
-    if [ -r /dev/tty ]; then
-        printf "Apple ID email: "
-        read -r APPLE_ID_EMAIL < /dev/tty
-    else
-        die "No controlling terminal available for Apple ID prompt"
-    fi
-    if [ -z "$APPLE_ID_EMAIL" ]; then
-        die "Apple ID email is required for plumesign login"
-    fi
-
-    if [ ! -t 0 ] && [ -r /dev/tty ]; then
-        ./bin/plumesign account login -u "$APPLE_ID_EMAIL" < /dev/tty
-    else
-        ./bin/plumesign account login -u "$APPLE_ID_EMAIL"
-    fi
-else
-    email=$("$VENV_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("selected_account","(unknown)"))' < "$HOME/.config/PlumeImpactor/accounts.json" 2>/dev/null || echo "(unknown)")
-    log "plumesign session already exists for $email"
-fi
+# Note: Apple ID login no longer happens in this script. On a fresh
+# install the menubar app starts in a "not logged in" state; the user
+# clicks the 🔥 flame icon, clicks the "Apple ID: not logged in" menu
+# header, and enters their credentials in a native dialog. The 2FA code
+# flow runs through another native dialog. All of this is done from
+# the menubar so there's nothing left that needs a terminal after this
+# script exits.
 
 # ---------------------------------------------------------------------------
-#  Step 8: Install launchd services
+#  Step 6: Install launchd services
 # ---------------------------------------------------------------------------
 
 log "Installing launchd services (tunneld LaunchDaemon + menubar LaunchAgent)"
@@ -225,7 +189,7 @@ echo
 "$VENV_PYTHON" src/install.py
 
 # ---------------------------------------------------------------------------
-#  Step 9: Pairing guidance
+#  Step 7: Next-step guidance
 # ---------------------------------------------------------------------------
 
 pair_count=0
@@ -233,9 +197,27 @@ if [ -d "$HOME/.pymobiledevice3" ]; then
     pair_count=$(find "$HOME/.pymobiledevice3" -name 'remote_*.plist' 2>/dev/null | wc -l | tr -d ' ')
 fi
 
+logged_in="no"
+if [ -f "$HOME/.config/PlumeImpactor/accounts.json" ]; then
+    logged_in="yes"
+fi
+
 echo
 log "Done. Look for the 🔥 flame icon in your menubar."
 echo
+
+if [ "$logged_in" = "no" ]; then
+    cat <<'EOF'
+First: log in to your Apple ID.
+
+  1. Click the 🔥 flame menubar icon.
+  2. Click the "⚠️ Apple ID: not logged in" row at the top of the menu.
+  3. Enter your Apple ID email, password, and the 6-digit 2FA code that
+     Apple sends to your trusted device. All three prompts are native
+     macOS dialogs — nothing else needs a terminal after this.
+
+EOF
+fi
 
 if [ "$pair_count" -eq 0 ]; then
     cat <<'EOF'
