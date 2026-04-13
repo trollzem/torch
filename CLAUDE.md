@@ -1,165 +1,287 @@
-# ATVLoader - Apple TV Sideloader for macOS
+# ATVLoader — macOS menubar sideloader for Apple TV, iPhone, iPad
 
-## Project Goal
-A macOS menubar app that signs and installs IPAs on Apple TV (tvOS 26+), replacing the broken ATVLoadly Docker setup. Uses `pymobiledevice3` for device communication and `zsign` for IPA signing.
+A macOS menubar app that signs and installs IPAs onto Apple TV (tvOS 26+),
+iPhone (iOS 17+), and iPad (iPadOS 17+) using a free Apple ID. Set it up
+once, drop IPAs into a folder, auto-refreshes every 6 days before the
+7-day free-tier profile expiry.
+
+Supersedes the broken ATVLoadly Docker setup (which uses libimobiledevice
+and cannot do RemotePairing — fatal on tvOS 26+).
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│  ATVLoader (macOS menubar app)                  │
-│  ┌───────────┐  ┌──────────┐  ┌─────────────┐  │
-│  │ rumps UI  │  │ Signing  │  │ Installer   │  │
-│  │ (menubar) │  │ (zsign)  │  │ (pymd3)     │  │
-│  └───────────┘  └──────────┘  └─────────────┘  │
-│        │              │              │          │
-│        └──────────────┼──────────────┘          │
-│                       │                         │
-│            ┌──────────▼──────────┐              │
-│            │ pymobiledevice3     │              │
-│            │ tunneld (WiFi)      │              │
-│            └──────────┬──────────┘              │
-│                       │                         │
-└───────────────────────┼─────────────────────────┘
-                        │ RemotePairing tunnel
-                ┌───────▼───────┐
-                │  Apple TV     │
-                │  Habibi TV    │
-                │  tvOS 26.4    │
-                │  192.168.68.82│
-                └───────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  ATVLoader menubar (rumps, user-level LaunchAgent)       │
+│  ┌────────────┐  ┌──────────┐  ┌────────────────────┐    │
+│  │ UI / state │  │ Refresh  │  │ Pairing            │    │
+│  │ rumps.App  │  │ scheduler│  │ (Terminal handoff) │    │
+│  └─────┬──────┘  └─────┬────┘  └─────────┬──────────┘    │
+│        │               │                 │               │
+│  ┌─────▼───────────────▼─────────────────▼────────────┐  │
+│  │ plumesign wrapper (patched Rust binary)            │  │
+│  │ PLUME_FORCE_TVOS=1 + PLUME_DELETE_AFTER_FINISHED=1 │  │
+│  │ staging-dir scrape + manual re-zip                 │  │
+│  └───────────────────┬─────────────────────────────────┘ │
+│                      │                                    │
+│  ┌───────────────────▼─────────────────────────────────┐  │
+│  │ pymobiledevice3 client                              │  │
+│  │ tunneld HTTP API + DVT pre-kill + apps install      │  │
+│  └───────────────────┬─────────────────────────────────┘  │
+└──────────────────────┼─────────────────────────────────────┘
+                       │
+              ┌────────▼────────────────────────┐
+              │  pymobiledevice3 tunneld         │
+              │  (root LaunchDaemon TODO,        │
+              │   currently manual sudo run)     │
+              │  HTTP API 127.0.0.1:49151        │
+              └────────┬────────────────────────┘
+                       │ RemotePairing tunnels (TUN ifaces)
+              ┌────────▼─────────┐
+              │  Paired devices  │
+              │  • Habibi TV     │
+              │  • Hazem iPhone  │
+              │  • (future)      │
+              └──────────────────┘
 ```
 
-## Key Technical Constraints
+## Load-bearing discoveries
 
-### Why ATVLoadly Broke (and why this project exists)
-- tvOS 26+ changed the device discovery protocol from `_apple-pairable._tcp` to `_remotepairing-manual-pairing._tcp`
-- tvOS 26+ deprecated traditional lockdown pairing; only RemotePairing (RemoteXPC) works
-- ATVLoadly's `libimobiledevice` cannot do RemotePairing — this is a fundamental protocol incompatibility
-- `pymobiledevice3` fully supports the new RemotePairing protocol and can install apps through it
-- The RemoteXPC lockdown explicitly raises `NotImplementedError("RemoteXPC lockdown version does not support pairing operations")` — there is NO way to create a traditional lockdown pair record through the tunnel
+These are things we learned the hard way during the spike and first
+product build. None of them are documented upstream.
 
-### The RemotePairing Flow
-1. `pymobiledevice3 remote pair` — discovers Apple TV via `_remotepairing-manual-pairing._tcp`, performs SRP handshake with PIN displayed on Apple TV, saves pair record to `~/.pymobiledevice3/remote_<identifier>.plist`
-2. `pymobiledevice3 remote tunneld --wifi` — maintains a persistent TCP tunnel to the paired Apple TV, exposes RSD (Remote Service Discovery) at `127.0.0.1:49151`
-3. Through the tunnel, ALL Apple TV services are accessible without traditional pairing: lockdown info, app install, provisioning, etc.
+### 1. tvOS provisioning via `subPlatform` body param
 
-### IPA Signing Requirements
-- Free Apple ID certs expire every 7 days — must auto-refresh
-- Signing requires: developer certificate + private key + provisioning profile matching device UDID
-- `zsign` (installed via `brew install zsign`) handles the actual binary re-signing
-- The HARD PART is obtaining the developer cert + provisioning profile from Apple's servers using a free Apple ID. This is what AltStore/SideStore/PlumeImpactor implement.
+`plumesign account register-device --udid <tvOS-UDID>` hits
+`/QH65B2/ios/addDevice.action` which is shared across platforms — Apple
+auto-detects `device_class: "tvOS"` from the UDID chip prefix
+(`00008110` = `AppleTV14,1`).
 
-## Current State (What's Done)
+BUT `plumesign sign --apple-id` normally generates an iOS + xrOS +
+visionOS profile, which Apple TV rejects with `ApplicationVerificationFailed:
+A valid provisioning profile for this executable was not found`.
 
-### On the Linux VM (192.168.68.75)
-- ATVLoadly upgraded to v0.3.7 (but still can't connect due to protocol change)
-- `pymobiledevice3` installed and RemotePairing completed with Apple TV
-- `pymobiledevice3-tunneld.service` — systemd service maintaining WiFi tunnel to Apple TV
-- `atvloadly-mdns-bridge.service` — re-publishes Apple TV's new mDNS service under old name (partial fix)
-- Pairing record: `~hazem/.pymobiledevice3/remote_155263B4-89DB-4F83-B237-170E0E8A6817.plist`
+**Fix:** we patched `plume_core::developer::qh::profile::qh_get_profile`
+to send `subPlatform: "tvOS"` in the POST body when
+`PLUME_FORCE_TVOS=1` is set. The URL stays at `/QH65B2/ios/…` — only
+the body parameter differs. This returns a real Apple-signed profile
+with `Platform: [tvOS]` and `ProvisionedDevices` containing the
+registered Apple TV UDID.
 
-### On the Mac (this project)
-- `pymobiledevice3` 9.9.1 installed (system-wide via pip --break-system-packages)
-- `zsign` 1.0.4 installed via Homebrew
-- `rumps` installed for menubar UI
-- Basic menubar app skeleton (`src/atvloader.py`)
-- Basic signing setup script (`src/setup_signing.py`)
-- YouTube.ipa and Streamer.ipa copied to `ipas/`
+Patch: [vendor/impactor-tvos.patch](vendor/impactor-tvos.patch)
+Built binary: [bin/plumesign](bin/plumesign) (arm64, ~9.2 MB)
 
-## What Needs To Be Done
+### 2. plumesign archive bug (v2.2.3)
 
-### Phase 1: Pairing from Mac (CRITICAL)
-The Mac needs its own RemotePairing with the Apple TV:
-1. Run `sudo pymobiledevice3 remote pair` from the Mac
-2. Apple TV must be in pairing mode (Settings > Remotes and Devices > Remote App and Devices)
-3. Enter the 6-digit PIN displayed on Apple TV
-4. This creates `~/.pymobiledevice3/remote_<id>.plist`
+`plumesign sign --package X.ipa -o Y.ipa` copies the **input file** to
+the output path instead of re-archiving the signed staging directory.
+The actual signing work happens correctly in
+`/var/folders/.../plume_stage_<uuid>/` but gets thrown away.
 
-### Phase 2: Tunnel from Mac
-1. Run `sudo pymobiledevice3 remote tunneld --wifi` as a persistent service (LaunchDaemon)
-2. Verify with: `curl http://127.0.0.1:49151/`
-3. Test device access: `sudo pymobiledevice3 lockdown info --rsd <addr> <port>`
+**Fix:** set `PLUME_DELETE_AFTER_FINISHED=1` to disable the cleanup,
+scrape the staging path from stderr (`"writing signed main executable
+to .../plume_stage_<uuid>/Payload/..."`), and re-zip `Payload/` ourselves
+with `zip -r -y -q` (the `-y` preserves symlinks which some frameworks
+need). See [src/atvloader/plumesign.py](src/atvloader/plumesign.py).
 
-### Phase 3: IPA Signing (THE HARD PART)
-Self-signed certs do NOT work — Apple TV rejects them with "No code signature found" or "ApplicationVerificationFailed". Need a real Apple-issued developer certificate.
+### 3. DVT pre-kill for running apps
 
-**Options (in order of feasibility):**
+`pymobiledevice3 apps install` hangs **indefinitely** on tvOS if the
+target bundle is currently running (installd waits for the frontmost
+app to exit). Lockdown info still works over the same tunnel, so it's
+not a tunnel issue — it's a per-service wait.
 
-1. **Use AltSign/SideServer protocol** — Implement the Apple ID → developer cert flow that AltStore uses. Python libraries to research:
-   - `altserver-linux` (has the protocol implementation in C++)
-   - `SideJITServer` (Python, may have relevant auth code)
-   - Apple's AuthKit/Grand Slam protocol for authentication
-   - Apple's developer provisioning API for cert/profile creation
+**Fix:** before every install, call
+`pymobiledevice3 developer dvt process-id-for-bundle-id <bundle-id>`
+to check for a running PID, then `dvt kill <pid>` if found. Best-effort
+(swallows DvtError for devices without Developer Mode). Also reduced
+the install subprocess timeout from 600s to 180s so genuine hangs
+surface as a clear error instead of silent freezes.
 
-2. **Use Xcode automatic signing** — If Xcode is signed into the same Apple ID, use `xcodebuild` to generate the cert and profile, then extract them for zsign.
+See [src/atvloader/pymd3.py](src/atvloader/pymd3.py) `terminate_bundle_if_running()`
+and `install_ipa()`.
 
-3. **Use an existing tool** — `ios-deploy`, `ideviceinstaller`, or `cfgutil` with Xcode signing
+### 4. rumps is Cocoa-main-thread-only
 
-4. **Manual cert export** — Have user sign in to Xcode → create a dummy tvOS project → export the cert+key+profile → place in `signing/` directory
+Calling `rumps.notification`, `rumps.alert`, `rumps.Window`, or
+mutating `self.menu` / `self.title` from a background thread **silently
+kills the process**. No traceback, no output, just gone.
 
-**Recommended: Start with option 4 (manual) for MVP, then automate with option 1 or 2.**
+**Pattern:** every worker-thread UI touch goes through `_on_main_thread()`
+(which wraps `PyObjCTools.AppHelper.callAfter`) or the
+`_run_on_main_and_wait()` helper for modal dialogs that need a return
+value. Periodic work uses `rumps.Timer` (NSTimer, fires on main thread),
+not `threading.Timer`.
 
-### Phase 4: Complete Menubar App
-- Wire up the full sign → install pipeline
-- Add auto-refresh timer (every 6 days)
-- Add app management (add/remove IPAs)
-- Proper error handling and notifications
-- LaunchAgent for auto-start on login
+See [src/atvloader/ui.py](src/atvloader/ui.py).
 
-### Phase 5: Polish
-- App icon (Apple TV icon in menubar)
-- py2app or PyInstaller packaging
-- First-run wizard for Apple ID setup
-- Progress indicators during sign/install
+### 5. iOS doesn't have a "pair device" screen
 
-## Apple TV Details
-- **Name:** Habibi TV
-- **Model:** AppleTV14,1 (J255AP)
-- **tvOS:** 26.4 (build 23L243)
-- **IP:** 192.168.68.82
-- **UDID:** 00008110-000E59EC3E41801E
-- **WiFi MAC:** 48:e1:5c:69:af:2b
-- **Ethernet MAC:** 48:e1:5c:75:c5:91
+Unlike tvOS, iPhones/iPads don't expose a manual pairing flow in Settings.
+The RemotePairing handshake happens automatically once the device is
+USB-trusted (the one-time "Trust This Computer" prompt). From then on,
+usbmuxd tunnels it over both USB and WiFi, and tunneld's HTTP API
+surfaces it as a regular tunnel entry.
 
-## Apple ID
-- **Email:** eissahazem@gmail.com
-- **Previous ATVLoadly password stored in DB:** (check session summary)
+**UX consequence:** "Add Apple TV" uses a Terminal handoff for the
+manual PIN dance. "Detect iPhone/iPad" just enumerates tunneld's current
+list and offers to add anything that isn't already tracked.
 
-## Key Commands
+## Why the old approach doesn't work
 
-```bash
-# Pair with Apple TV (requires sudo, Apple TV in pairing mode)
-sudo pymobiledevice3 remote pair
+Kept for future reference — these are dead ends we ruled out.
 
-# Start persistent tunnel
-sudo pymobiledevice3 remote tunneld --wifi
+- **libimobiledevice / ATVLoadly** — uses traditional lockdown pairing,
+  which tvOS 26+ removed. RemoteXPC lockdown explicitly raises
+  `NotImplementedError("RemoteXPC lockdown version does not support
+  pairing operations")`.
+- **Self-signed certs** — Apple TV rejects with
+  `ApplicationVerificationFailed: No code signature found`. The profile
+  must be signed by Apple's CA.
+- **Writing our own Grand Slam / AuthKit auth in Python** — no maintained
+  library exists; anisette generation is a real cryptographic barrier;
+  plumesign uses an external anisette server (`ani.stikstore.app`).
+- **plumesign's built-in install** — usbmux-only; Apple TV 4K has no
+  USB port. We use plumesign for signing only; pymobiledevice3 does the
+  install over the WiFi tunnel.
+- **Xcode automatic tvOS provisioning** — Xcode 26 + tvOS 26.4 does not
+  wirelessly see Apple TVs via CoreDevice. `xcrun xctrace list devices`
+  and `xcrun devicectl list devices` both return only USB-connected
+  iPhones on this setup.
+- **/tvos/ endpoint family** — Apple has `/QH65B2/tvos/…` URLs in their
+  dev portal but they return empty responses for free-tier accounts
+  (`UnexpectedEndOfEventStream` when plumesign tries to parse them).
+  The working mechanism is the `subPlatform` body param on the /ios/
+  endpoint, not a different URL.
 
-# Check tunnel
-curl http://127.0.0.1:49151/
+## Project layout
 
-# Get device info through tunnel
-sudo pymobiledevice3 lockdown info --rsd <TUNNEL_ADDR> <TUNNEL_PORT>
+```
+~/Desktop/Projects/ATVLoader/
+├── src/
+│   └── atvloader/
+│       ├── __init__.py
+│       ├── __main__.py       # `python3 -m atvloader` entry point
+│       ├── paths.py          # Application Support + project + external dirs
+│       ├── config.py         # dataclass schema + bootstrap + sync_ipas_folder
+│       ├── keychain.py       # keyring wrapper for Apple ID credentials
+│       ├── plumesign.py      # subprocess wrapper (login, register, sign)
+│       ├── pymd3.py          # tunneld client + reconcile + install + DVT
+│       ├── pairing.py        # pexpect-driven RemotePairing (for tvOS)
+│       ├── refresh.py        # sign → install orchestrator + lock
+│       └── ui.py             # rumps menubar app
+├── bin/
+│   └── plumesign             # our patched Rust binary (tracked in git)
+├── vendor/
+│   └── impactor-tvos.patch   # the plumesign source patch
+├── ipas/
+│   ├── YouTube.ipa           # source IPAs (copied into runtime dir on boot)
+│   └── Streamer.ipa
+├── signed/                   # project-local signed outputs (gitignored)
+├── docs/
+│   ├── SESSION_SUMMARY.md    # historical spike-era doc
+│   └── plans/
+│       └── 2026-04-12-atvloader-product-design.md
+├── requirements.txt
+└── README.md
+```
 
-# Install a signed IPA
-sudo pymobiledevice3 apps install --rsd <TUNNEL_ADDR> <TUNNEL_PORT> signed.ipa
+Runtime state (not in repo):
 
-# Sign an IPA with zsign
-zsign -k key.pem -c cert.pem -m profile.mobileprovision -o signed.ipa input.ipa
+```
+~/Library/Application Support/ATVLoader/
+  ipas/                # user-added + project-mirrored IPAs
+  signed/              # plumesign output (per-IPA, per-platform)
+  config.json          # tracked IPAs, devices, settings
+  logs/atvloader.log
+```
 
-# List apps on Apple TV
-sudo pymobiledevice3 apps list --rsd <TUNNEL_ADDR> <TUNNEL_PORT>
+External state owned by other tools:
+
+```
+~/.config/PlumeImpactor/      # plumesign session (accounts.json, state.plist, keys/)
+~/.pymobiledevice3/           # pair records (remote_<uuid>.plist)
 ```
 
 ## Dependencies
-- Python 3.14+ (system)
-- pymobiledevice3 9.9.1 (`pip3 install pymobiledevice3 --break-system-packages`)
-- rumps 0.4.0 (`pip3 install rumps --break-system-packages`)
-- zsign 1.0.4 (`brew install zsign`)
 
-## Linux VM SSH Access
-- **Host:** 192.168.68.75 (UTM VM running Debian)
-- **User:** hazem
-- **Password:** gameboy
-- **SSH key:** was set up at /tmp/atv_key (may need to regenerate)
-- **ATVLoadly web UI:** http://192.168.68.75/
+Python 3.14 (Homebrew):
+- `rumps` — menubar
+- `pyobjc-framework-Cocoa` — NSWorkspace wake notification + AppHelper.callAfter
+- `pexpect` — driving plumesign + pymobiledevice3 remote pair interactive prompts
+- `keyring` — macOS Keychain
+- `pymobiledevice3 ≥ 9.9.1` — device communication (subprocess, not library)
+
+Rebuilding plumesign from source (only needed if `bin/plumesign` is
+missing or we bump Impactor upstream):
+- `cargo` + `rustc` via `brew install rust`
+- Clone `CLARATION/Impactor` at `v2.2.3`
+- `git apply vendor/impactor-tvos.patch`
+- `cargo build --release -p plumesign`
+- Copy `target/release/plumesign` to `bin/plumesign`
+
+## How to run
+
+```bash
+# One-time setup (on a fresh Mac)
+pip3 install --break-system-packages -r requirements.txt
+# + a manual `sudo pymobiledevice3 remote tunneld --wifi` in a terminal
+#   until the launchd installer (step 8) exists
+
+# Launch the menubar
+cd ~/Desktop/Projects/ATVLoader
+PYTHONPATH=src python3 -m atvloader
+```
+
+Logs: `~/Library/Application Support/ATVLoader/logs/atvloader.log`
+or menubar → View Log.
+
+## Apple TV / device details
+
+- **Apple TV:** Habibi TV · AppleTV14,1 · tvOS 26.4 · build 23L243
+  UDID `00008110-000E59EC3E41801E` · WiFi MAC `48:e1:5c:69:af:2b`
+  Ethernet MAC `48:e1:5c:75:c5:91` · Currently 192.168.68.82
+- **iPhone:** Hazem · iPhone18,4 · iOS 26.3
+  UDID `00008150-001E1D8C0AF8401C`
+  Already USB-trusted; visible in tunneld as `usbmux-00008150-...-Network`
+
+## Apple ID
+
+- **Email:** eissahazem@gmail.com
+- **Team ID:** 3G6AP3U89B (Individual, Xcode Free Provisioning Program)
+- plumesign session persisted at `~/.config/PlumeImpactor/`. No 2FA
+  needed on subsequent runs — the cached session handles everything.
+
+## Known gaps / TODO
+
+- **LaunchDaemon for tunneld** — currently started manually via
+  `sudo pymobiledevice3 remote tunneld --wifi` in a terminal. Needs to
+  be installed as `/Library/LaunchDaemons/com.atvloader.tunneld.plist`
+  running as root so it persists across reboots and doesn't depend on
+  an open terminal. An install script in `src/install.py` is planned
+  but not yet written.
+- **LaunchAgent for the menubar app** — same story; currently launched
+  manually via `python3 -m atvloader` for dev. Will become
+  `~/Library/LaunchAgents/com.atvloader.app.plist` with `KeepAlive=true`.
+- **First-run wizard** — designed in
+  [docs/plans/2026-04-12-atvloader-product-design.md](docs/plans/2026-04-12-atvloader-product-design.md)
+  but not yet implemented. For now the app seeds entirely from
+  existing state on disk (plumesign session + pair records + project
+  IPAs), which works because the spike left that state in place.
+- **Xcode automatic signing fallback** — not implemented, probably
+  not needed given the plumesign flow works.
+- **py2app packaging** — out of scope for v1. Current invocation is
+  `python3 -m atvloader`, which makes the dock show "Python" instead
+  of "ATVLoader" — cosmetic only.
+
+## Linux VM notes (historical)
+
+The original spike work happened on a Linux VM at 192.168.68.75 (UTM,
+Debian, user `hazem`, password `gameboy`). That VM is no longer the
+primary execution environment — everything runs natively on the Mac
+now. The VM still has:
+- `pymobiledevice3-tunneld.service` (systemd)
+- `atvloadly-mdns-bridge.service`
+- ATVLoadly web UI at http://192.168.68.75/ (broken post tvOS 26)
+
+Safe to leave running or shut down as desired.

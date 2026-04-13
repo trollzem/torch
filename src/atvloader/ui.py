@@ -31,11 +31,65 @@ from pathlib import Path
 
 import rumps
 
+try:
+    from PyObjCTools import AppHelper  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    AppHelper = None  # type: ignore[assignment]
+
 from . import config as cfgmod
 from . import pairing, paths, plumesign, pymd3, refresh
 from .config import Config
 
 log = logging.getLogger(__name__)
+
+
+def _on_main_thread(callable_: "object") -> None:
+    """Marshal a zero-arg callable onto the Cocoa main thread.
+
+    rumps / NSUserNotificationCenter / NSMenu mutations must run on the
+    main thread; calling them from a background worker can (and does)
+    silently kill the process. We wrap every cross-thread UI touch in
+    this so the worker threads doing long-running plumesign / pymd3
+    work can safely signal progress back to the menu.
+
+    Falls back to calling inline if PyObjC isn't available for some
+    reason — which means we're already on the main thread (no Cocoa
+    runloop), or in a degraded test scenario.
+    """
+    if AppHelper is None:
+        callable_()  # type: ignore[misc]
+        return
+    AppHelper.callAfter(callable_)
+
+
+def _run_on_main_and_wait(func, *args, **kwargs):  # type: ignore[no-untyped-def]
+    """Dispatch a callable to the main thread and block until it returns.
+
+    Used by worker threads that need modal dialogs (rumps.alert,
+    rumps.Window) — those must run on the Cocoa main thread, but the
+    worker needs the return value to continue its flow.
+
+    Raises any exception the target callable raised.
+    """
+    if AppHelper is None:
+        return func(*args, **kwargs)
+
+    result: dict[str, object] = {}
+    done = threading.Event()
+
+    def _body() -> None:
+        try:
+            result["value"] = func(*args, **kwargs)
+        except BaseException as e:  # noqa: BLE001
+            result["error"] = e
+        finally:
+            done.set()
+
+    AppHelper.callAfter(_body)
+    done.wait()
+    if "error" in result:
+        raise result["error"]  # type: ignore[misc]
+    return result.get("value")
 
 
 ICON_IDLE = "📺"
@@ -109,12 +163,19 @@ class ATVLoaderApp(rumps.App):
         self._state_lock = threading.Lock()
         self._icon_state: str = ICON_IDLE
         self._build_menu()
-        self._start_scheduler_thread()
+        # rumps.Timer runs its callback on the main thread, which is
+        # exactly what we need for anything that touches self.menu /
+        # self.title / rumps.notification. The timer itself schedules
+        # at the given interval; calling .start() arms it.
+        self._hourly_timer = rumps.Timer(self._on_hourly_tick, HOURLY_TICK_SECONDS)
+        self._hourly_timer.start()
         self._install_wake_observer()
-        # Kick off an initial refresh check shortly after launch so the
-        # user sees activity if anything is stale on cold start. Non-
-        # blocking — runs on a worker thread.
-        self._background_check(delay=2.0)
+        # Kick off an initial refresh check shortly after launch via a
+        # one-shot timer so it runs on the main thread (which then
+        # dispatches the actual signing work onto a worker via
+        # _background_check).
+        self._initial_kick = rumps.Timer(self._on_initial_kick, 2.0)
+        self._initial_kick.start()
 
     # --- menu wiring ---------------------------------------------------------
 
@@ -145,7 +206,9 @@ class ATVLoaderApp(rumps.App):
         self.menu.add(rumps.MenuItem(self._status_summary(), callback=None))
         self.menu.add(rumps.separator)
 
-        # Apps submenu
+        # Apps submenu — each IPA is a parent item with a sub-menu
+        # that exposes a per-app "Refresh now" action and a tooltip-ish
+        # line showing the original bundle ID.
         apps_item = rumps.MenuItem("Apps")
         if self.cfg.ipas:
             for ipa in sorted(self.cfg.ipas, key=lambda i: i.filename):
@@ -165,7 +228,51 @@ class ATVLoaderApp(rumps.App):
                     f"{status_icon} {Path(ipa.filename).stem} · "
                     f"{ipa.platform} · {_format_expiry(ipa.last_signed_at)}"
                 )
-                apps_item.add(rumps.MenuItem(label, callback=None))
+                ipa_parent = rumps.MenuItem(label)
+
+                # Capture filename in a default arg to avoid the usual
+                # Python closure-over-loop-variable pitfall.
+                def _refresh_cb(_sender, fn=ipa.filename):  # type: ignore[no-untyped-def]
+                    self._refresh_one(fn)
+
+                def _remove_cb(_sender, fn=ipa.filename):  # type: ignore[no-untyped-def]
+                    self._remove_ipa(fn)
+
+                ipa_parent.add(rumps.MenuItem("Refresh now", callback=_refresh_cb))
+                ipa_parent.add(
+                    rumps.MenuItem("Remove from tracking", callback=_remove_cb)
+                )
+                ipa_parent.add(rumps.separator)
+                ipa_parent.add(
+                    rumps.MenuItem(
+                        f"Bundle: {ipa.original_bundle_id}", callback=None
+                    )
+                )
+                if ipa.signed_bundle_id:
+                    ipa_parent.add(
+                        rumps.MenuItem(
+                            f"Signed as: {ipa.signed_bundle_id}", callback=None
+                        )
+                    )
+                if ipa.last_signed_at:
+                    ipa_parent.add(
+                        rumps.MenuItem(
+                            f"Signed: {_format_age(ipa.last_signed_at)}",
+                            callback=None,
+                        )
+                    )
+                if ipa.status not in ("ok", "pending"):
+                    ipa_parent.add(
+                        rumps.MenuItem(f"Status: {ipa.status}", callback=None)
+                    )
+                    if ipa.last_error:
+                        ipa_parent.add(
+                            rumps.MenuItem(
+                                f"Error: {ipa.last_error[:60]}…",
+                                callback=None,
+                            )
+                        )
+                apps_item.add(ipa_parent)
         else:
             apps_item.add(rumps.MenuItem("No IPAs yet", callback=None))
         apps_item.add(rumps.separator)
@@ -189,10 +296,16 @@ class ATVLoaderApp(rumps.App):
             devices_item.add(rumps.MenuItem("No devices paired", callback=None))
         devices_item.add(rumps.separator)
         devices_item.add(
-            rumps.MenuItem("Add device (Apple TV)…", callback=self.on_add_device_tv)
+            rumps.MenuItem(
+                "Add Apple TV (pair via Terminal)…",
+                callback=self.on_add_device_tv,
+            )
         )
         devices_item.add(
-            rumps.MenuItem("Add device (iPhone/iPad)…", callback=self.on_add_device_ios)
+            rumps.MenuItem(
+                "Detect iPhone/iPad (via USB trust)…",
+                callback=self.on_add_device_ios,
+            )
         )
         self.menu.add(devices_item)
 
@@ -225,16 +338,51 @@ class ATVLoaderApp(rumps.App):
         self._icon_state = icon
         self.title = icon
 
-    def _rebuild(self) -> None:
-        """Rebuild menu + icon from current config. Safe to call from any thread."""
+    def _rebuild(self, *, respect_refreshing: bool = False) -> None:
+        """Rebuild menu + icon from current config.
+
+        MUST be called on the main thread. Use _rebuild_async() from
+        worker threads.
+
+        When `respect_refreshing` is True, the icon is left at 📺⏳ if
+        a refresh is currently in progress. We use that during mid-
+        refresh rebuilds so the progress indicator doesn't flicker.
+        """
         try:
             self._build_menu()
-            self._refresh_icon()
+            self._refresh_icon(respect_refreshing=respect_refreshing)
         except Exception as e:  # noqa: BLE001
             log.exception("menu rebuild failed: %s", e)
 
-    def _refresh_icon(self) -> None:
-        if self._icon_state == ICON_REFRESHING:
+    def _rebuild_async(self) -> None:
+        """Queue a rebuild to run on the main thread. Safe from any thread."""
+        _on_main_thread(self._rebuild)
+
+    def _notify_async(self, title: str, subtitle: str, message: str) -> None:
+        """Queue a notification onto the main thread. Safe from any thread."""
+        def _do() -> None:
+            try:
+                rumps.notification(title, subtitle, message)
+            except Exception as e:  # noqa: BLE001
+                log.warning("notification failed: %s", e)
+        _on_main_thread(_do)
+
+    def _set_icon_async(self, icon: str) -> None:
+        """Queue an icon change onto the main thread. Safe from any thread."""
+        def _do() -> None:
+            self._set_icon(icon)
+        _on_main_thread(_do)
+
+    def _refresh_icon(self, *, respect_refreshing: bool = False) -> None:
+        """Re-derive the menubar icon from current config state.
+
+        When `respect_refreshing` is True, a refresh-in-progress icon is
+        left alone so the menu rebuilds mid-refresh don't flicker the
+        icon away from 📺⏳. When the refresh completes we call this
+        with respect_refreshing=False to reset the icon to whatever the
+        config now warrants.
+        """
+        if respect_refreshing and self._icon_state == ICON_REFRESHING:
             return
         if any(i.status not in ("ok", "pending") for i in self.cfg.ipas):
             self._set_icon(ICON_ERROR)
@@ -251,9 +399,59 @@ class ATVLoaderApp(rumps.App):
     # --- menu callbacks ------------------------------------------------------
 
     def on_refresh_now(self, _sender: object) -> None:
+        # Callback is already on main thread — schedule worker immediately.
         self._background_check(force=True)
 
+    def _refresh_one(self, filename: str) -> None:
+        """Trigger a force-refresh of a single IPA by filename. Called from
+        a main-thread menu callback; dispatches the actual work onto a
+        worker."""
+        log.info("per-app refresh requested: %s", filename)
+        threading.Thread(
+            target=self._do_refresh_worker,
+            kwargs={"force": True, "only": [filename]},
+            daemon=True,
+            name=f"atvloader-refresh-{filename}",
+        ).start()
+
+    def _remove_ipa(self, filename: str) -> None:
+        """Untrack an IPA (and delete the file from the runtime ipas/
+        folder so it doesn't get re-added by sync_ipas_folder on the
+        next startup). Main-thread callback."""
+        log.info("removing IPA: %s", filename)
+        if rumps.alert(
+            title="Remove IPA?",
+            message=(
+                f"Stop tracking {filename} and delete it from the ATVLoader "
+                f"IPAs folder? The signed copy on your devices will not be "
+                f"uninstalled."
+            ),
+            ok="Remove",
+            cancel="Cancel",
+        ) != 1:
+            return
+
+        # Delete source file from runtime dir + any signed variant
+        try:
+            source = paths.IPAS_DIR / filename
+            if source.exists():
+                source.unlink()
+            signed_stem = Path(filename).stem
+            for p in paths.SIGNED_DIR.glob(f"{signed_stem}-*.ipa"):
+                p.unlink()
+        except OSError as e:
+            log.warning("cleanup during remove failed: %s", e)
+
+        # Drop from config
+        self.cfg.ipas = [i for i in self.cfg.ipas if i.filename != filename]
+        self.cfg.save()
+        self._rebuild()
+        rumps.notification(
+            "ATVLoader", "IPA removed", f"{filename} is no longer tracked."
+        )
+
     def on_toggle_pause(self, _sender: object) -> None:
+        # Main-thread callback: safe to mutate config and rebuild directly.
         with self._state_lock:
             self.cfg.settings.auto_refresh_paused = (
                 not self.cfg.settings.auto_refresh_paused
@@ -266,6 +464,15 @@ class ATVLoaderApp(rumps.App):
             else "Auto-refresh resumed"
         )
         rumps.notification("ATVLoader", "Settings", msg)
+
+    def _on_hourly_tick(self, _timer: object) -> None:
+        """rumps.Timer callback — runs on main thread, delegates to worker."""
+        self._background_check(force=False)
+
+    def _on_initial_kick(self, _timer: object) -> None:
+        """One-shot timer to fire the initial refresh check after launch."""
+        self._initial_kick.stop()
+        self._background_check(force=False)
 
     def on_add_ipa(self, _sender: object) -> None:
         # We can't open an NSOpenPanel easily from rumps without PyObjC
@@ -283,119 +490,263 @@ class ATVLoaderApp(rumps.App):
     # --- device onboarding ---------------------------------------------------
 
     def on_add_device_tv(self, _sender: object) -> None:
-        threading.Thread(
-            target=self._add_device_flow,
-            args=("tvOS",),
-            daemon=True,
-            name="atvloader-add-tv",
-        ).start()
+        self._start_pairing_handoff(device_kind="tvOS")
 
     def on_add_device_ios(self, _sender: object) -> None:
-        threading.Thread(
-            target=self._add_device_flow,
-            args=("iOS",),
-            daemon=True,
-            name="atvloader-add-ios",
-        ).start()
+        """Auto-detect a USB-trusted iPhone/iPad via tunneld and add it.
 
-    def _add_device_flow(self, device_kind: str) -> None:
-        """Interactive device pairing. Runs on a worker thread.
+        iOS devices don't have a user-visible "pair with computer"
+        screen the way tvOS does. Trust is established once via the
+        "Trust This Computer" prompt when you first plug in the USB
+        cable; from then on, usbmuxd handles the pairing transparently
+        and exposes the device over both USB and WiFi. tunneld picks
+        it up automatically. All we need to do here is enumerate
+        tunneled devices that aren't already in our config and offer
+        to add them.
 
-        device_kind is "tvOS" or "iOS" — used only to customize the
-        instructions shown to the user. The pairing protocol itself is
-        the same RemotePairing handshake for both.
+        This runs entirely on the main thread (rumps menu callback),
+        so rumps.alert() and config.save() are safe to call directly.
         """
-        # Step 1: instructions. rumps.alert() is a modal NSAlert which
-        # returns 1 for OK, 0 for Cancel.
+        try:
+            info = pymd3.tunneld_info()
+        except pymd3.TunneldDownError:
+            rumps.alert(
+                title="Tunneld is down",
+                message=(
+                    "Couldn't reach the background tunnel service. "
+                    "Make sure pymobiledevice3 tunneld is running."
+                ),
+            )
+            return
+
+        # Filter out devices we already track.
+        tracked_ids = {d.pair_record_identifier for d in self.cfg.devices}
+        candidates = [pid for pid in info.keys() if pid not in tracked_ids]
+
+        if not candidates:
+            rumps.alert(
+                title="No new devices",
+                message=(
+                    "Tunneld doesn't see any devices that ATVLoader "
+                    "isn't already tracking.\n\n"
+                    "If your iPhone or iPad isn't showing up, plug it "
+                    "in with a USB cable and tap 'Trust This Computer' "
+                    "on the device. After that it'll appear here "
+                    "automatically."
+                ),
+            )
+            return
+
+        # For each candidate, try to reconcile against tunneld to get a
+        # friendly name, UDID, and device class. Skip anything that
+        # fails to reconcile (offline, lockdown failed, etc.).
+        from .config import Device
+
+        resolved: list[tuple[str, Device]] = []
+        for pid in candidates:
+            stub = Device(
+                name=pid,
+                pair_record_identifier=pid,
+                udid=None,
+                device_class="unknown",
+                paired_at=datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                ),
+                pair_record_path=None,
+            )
+            try:
+                reconciled = pymd3.reconcile_device(stub)
+            except pymd3.Pymd3Error as e:
+                log.warning("could not reconcile %s: %s", pid, e)
+                continue
+            resolved.append((pid, reconciled))
+
+        if not resolved:
+            rumps.alert(
+                title="No reachable devices",
+                message=(
+                    "Tunneld knows about devices but none of them could "
+                    "be queried. Make sure the target device is powered "
+                    "on and on the same network."
+                ),
+            )
+            return
+
+        # Present each resolved device as a confirmation dialog. If the
+        # user has multiple new devices we loop and ask one at a time.
+        added_count = 0
+        for pid, device in resolved:
+            name = device.name or pid
+            class_info = ""
+            if device.device_class and device.device_class != "unknown":
+                class_info = f" ({device.device_class}"
+                if device.product_type:
+                    class_info += f" · {device.product_type}"
+                if device.product_version:
+                    class_info += f" · {device.product_version}"
+                class_info += ")"
+
+            prompt = (
+                f"Found: {name}{class_info}\n\n"
+                f"Add this device to ATVLoader? All tracked IPAs will "
+                f"be auto-targeted at it."
+            )
+            if rumps.alert(
+                title="Add device?", message=prompt, ok="Add", cancel="Skip"
+            ) != 1:
+                continue
+
+            # Append to config, auto-target existing IPAs, save, rebuild.
+            self.cfg.devices.append(device)
+            for ipa in self.cfg.ipas:
+                if pid not in ipa.target_devices:
+                    ipa.target_devices.append(pid)
+
+            # Best-effort register with Apple portal.
+            if device.udid:
+                try:
+                    plumesign.register_device(device.udid, device.name)
+                except plumesign.PlumesignError as e:
+                    log.debug("register_device %s: %s", device.udid, e)
+
+            added_count += 1
+
+        if added_count > 0:
+            self.cfg.save()
+            self._rebuild()
+            rumps.notification(
+                "ATVLoader",
+                "Device added",
+                f"{added_count} device{'s' if added_count != 1 else ''} "
+                f"added. They'll be refreshed on the next cycle.",
+            )
+
+    def _start_pairing_handoff(self, *, device_kind: str) -> None:
+        """Hand the pairing flow off to a Terminal window.
+
+        Runs entirely on the main thread (no worker, no cross-thread
+        modals). We open Terminal.app with the pairing command pre-
+        filled, then start a rumps.Timer that polls
+        ~/.pymobiledevice3/ every 3 seconds for up to 3 minutes
+        looking for a new remote_*.plist file. When one appears,
+        we reconcile it against tunneld, register with Apple, and
+        update the menu.
+
+        This is deliberately less fancy than a native modal flow
+        because rumps + worker threads + Cocoa modals is a footgun
+        that crashed the app the first time we tried it.
+        """
         if device_kind == "tvOS":
             msg = (
                 "On your Apple TV, go to:\n\n"
                 "Settings → General → Remotes and Devices → "
                 "Remote App and Devices\n\n"
-                "Leave that screen open, then click OK to start the scan."
+                "Leave that screen open, then click OK. A Terminal "
+                "window will open to collect the 6-digit PIN."
             )
         else:
             msg = (
                 "On your iPhone or iPad (iOS 17+), go to:\n\n"
                 "Settings → Privacy & Security → Developer Mode → "
                 "Pair Device\n\n"
-                "Leave that screen open, then click OK to start the scan."
+                "Leave that screen open, then click OK. A Terminal "
+                "window will open to collect the 6-digit PIN."
             )
-        if rumps.alert(title="Add device", message=msg, ok="OK", cancel="Cancel") != 1:
+
+        if rumps.alert(
+            title="Add device", message=msg, ok="OK", cancel="Cancel"
+        ) != 1:
             return
 
-        # Step 2: bonjour scan for devices in pairing mode.
-        try:
-            candidates = pymd3.scan_manual_pairing(timeout=10.0)
-        except pymd3.Pymd3Error as e:
-            rumps.alert(
-                title="Scan failed",
-                message=f"Could not scan for devices: {e}",
-            )
-            return
+        # Record the set of pair records present RIGHT NOW so we can
+        # detect which one is new after the user finishes in Terminal.
+        self._pairing_baseline: set[str] = {
+            p.stem.removeprefix("remote_")
+            for p in paths.PYMD3_PAIR_RECORDS_DIR.glob("remote_*.plist")
+        } if paths.PYMD3_PAIR_RECORDS_DIR.exists() else set()
 
-        if not candidates:
-            rumps.alert(
-                title="No device found",
-                message=(
-                    "Nothing is advertising a pairing prompt on the network. "
-                    "Make sure the device is on the same WiFi and the "
-                    "pairing screen is still open."
-                ),
-            )
-            return
-
-        # For v1 we pair with the first advertising device. If there are
-        # multiple (rare — you'd have to have two Apple TVs in pairing mode
-        # simultaneously) we take the first.
-        target = candidates[0]
-        target_name = target.get("name") or "unknown device"
-
-        # Step 3: spawn the pairing handshake and collect the PIN.
-        def pin_prompt() -> str:
-            result = rumps.Window(
-                message=(
-                    f"Enter the 6-digit pairing code shown on "
-                    f"{target_name}."
-                ),
-                title="Enter pairing code",
-                default_text="",
-                ok="Pair",
-                cancel="Cancel",
-                dimensions=(160, 20),
-            ).run()
-            if not result.clicked:
-                raise pairing.PairingCancelledError("user cancelled PIN dialog")
-            return result.text.strip()
-
-        try:
-            pair_id = pairing.pair_device(target_name, pin_prompt)
-        except pairing.PairingCancelledError:
-            return
-        except pairing.PairingError as e:
-            rumps.alert(title="Pairing failed", message=str(e))
-            return
-
-        # Step 4: reconcile the new device so we get its real UDID, then
-        # register with the Apple portal and save config.
-        try:
-            self._post_pair_reconcile(pair_id, fallback_name=target_name)
-        except Exception as e:  # noqa: BLE001
-            log.exception("post-pair reconcile failed: %s", e)
-            rumps.alert(
-                title="Pairing recorded but not complete",
-                message=(
-                    f"The pairing file was saved but we couldn't finish "
-                    f"registering the device: {e}"
-                ),
-            )
-            return
+        # Open Terminal running the pairing command. Using osascript so
+        # Terminal.app is brought to the foreground cleanly. Any pre-
+        # existing pymobiledevice3 in PATH is fine — we rely on the
+        # same `pymobiledevice3` used everywhere else in the app.
+        script = (
+            'tell application "Terminal" to activate\n'
+            'tell application "Terminal" to do script '
+            '"pymobiledevice3 remote pair; '
+            'echo; echo \\"Pairing finished. You can close this window.\\""'
+        )
+        subprocess.run(["osascript", "-e", script])
 
         rumps.notification(
             "ATVLoader",
-            "Device added",
-            f"{target_name} is ready to receive app refreshes.",
+            "Pairing in progress",
+            "Enter the 6-digit code in the Terminal window that just "
+            "opened. I'll pick up the new device automatically.",
         )
+
+        # Poll for a new pair record every 3 seconds for up to 3 minutes.
+        self._pairing_deadline = time.monotonic() + 180
+        self._pairing_timer = rumps.Timer(self._poll_for_new_pair_record, 3.0)
+        self._pairing_timer.start()
+
+    def _poll_for_new_pair_record(self, _timer: object) -> None:
+        """rumps.Timer callback — main thread. Checks for a new pair record."""
+        if time.monotonic() > self._pairing_deadline:
+            log.info("pairing deadline reached; stopping poll")
+            self._pairing_timer.stop()
+            rumps.notification(
+                "ATVLoader",
+                "Pairing timed out",
+                "No new device appeared in the last 3 minutes. "
+                "If you finished the pairing in Terminal, click "
+                "'Refresh Now' to try again.",
+            )
+            return
+
+        current = (
+            {
+                p.stem.removeprefix("remote_")
+                for p in paths.PYMD3_PAIR_RECORDS_DIR.glob("remote_*.plist")
+            }
+            if paths.PYMD3_PAIR_RECORDS_DIR.exists()
+            else set()
+        )
+        new_ids = current - self._pairing_baseline
+        if not new_ids:
+            return
+
+        new_pair_id = next(iter(new_ids))
+        log.info("discovered new pair record: %s", new_pair_id)
+        self._pairing_timer.stop()
+        # Kick the post-pair reconcile to a worker so we don't block
+        # the main thread while tunneld connects to the new device.
+        threading.Thread(
+            target=self._post_pair_reconcile_worker,
+            args=(new_pair_id,),
+            daemon=True,
+            name="atvloader-post-pair",
+        ).start()
+
+    def _post_pair_reconcile_worker(self, pair_id: str) -> None:
+        """Worker-thread post-pair: reconcile + register + update config.
+        All UI updates marshal back through _notify_async / _rebuild_async."""
+        try:
+            self._post_pair_reconcile(pair_id, fallback_name=pair_id)
+        except Exception as e:  # noqa: BLE001
+            log.exception("post-pair reconcile failed: %s", e)
+            self._notify_async(
+                "ATVLoader",
+                "Pairing incomplete",
+                f"Pair record saved but registration failed: {e}",
+            )
+            return
+
+        self._notify_async(
+            "ATVLoader",
+            "Device added",
+            "The new device is ready to receive app refreshes.",
+        )
+        self._rebuild_async()
 
     def _post_pair_reconcile(self, pair_id: str, *, fallback_name: str) -> None:
         """After a successful pair, create the Device entry, reconcile it
@@ -464,86 +815,85 @@ class ATVLoaderApp(rumps.App):
     def on_view_log(self, _sender: object) -> None:
         subprocess.run(["open", "-a", "Console", str(paths.LOG_FILE)])
 
-    # --- scheduler / worker threads ------------------------------------------
+    # --- worker threads ------------------------------------------------------
 
-    def _background_check(
-        self, *, force: bool = False, delay: float = 0.0
-    ) -> None:
-        """Run a refresh check on a worker thread. Multiple calls collapse
-        into one because refresh_all() is lock-guarded."""
+    def _background_check(self, *, force: bool = False) -> None:
+        """Spawn a worker thread that runs a full refresh cycle.
+
+        Only touches rumps / self.menu / self.title through the *_async()
+        helpers, which marshal back to the main thread via AppHelper. This
+        is critical: calling rumps APIs from worker threads silently kills
+        the app in Cocoa-land.
+        """
 
         def run() -> None:
-            if delay > 0:
-                time.sleep(delay)
-            self._do_refresh(force=force)
+            self._do_refresh_worker(force=force)
 
-        t = threading.Thread(target=run, daemon=True, name="atvloader-refresh")
+        t = threading.Thread(
+            target=run, daemon=True, name="atvloader-refresh-worker"
+        )
         t.start()
 
-    def _do_refresh(self, *, force: bool) -> None:
-        previous_icon = self._icon_state
-        self._set_icon(ICON_REFRESHING)
-        self._rebuild()
+    def _do_refresh_worker(
+        self, *, force: bool, only: list[str] | None = None
+    ) -> None:
+        """Full (or filtered) refresh cycle. Runs on a worker thread;
+        MUST NOT touch rumps APIs directly — everything UI goes through
+        *_async() helpers."""
+        self._set_icon_async(ICON_REFRESHING)
 
         def progress(msg: str) -> None:
             log.debug("progress: %s", msg)
 
         try:
-            self.cfg = cfgmod.Config.load()
+            cfg_snapshot = cfgmod.Config.load()
             succeeded, failed = refresh.refresh_all(
-                self.cfg, force=force, progress=progress
+                cfg_snapshot, force=force, only=only, progress=progress
             )
         except refresh.RefreshAborted as e:
-            self._set_icon(ICON_ERROR)
-            rumps.notification(
-                "ATVLoader",
-                "Refresh aborted",
-                str(e),
-            )
-            self._rebuild()
+            log.warning("refresh aborted: %s", e)
+            self._set_icon_async(ICON_ERROR)
+            self._notify_async("ATVLoader", "Refresh aborted", str(e))
+            self._reload_and_rebuild_async()
             return
         except Exception as e:  # noqa: BLE001
             log.exception("unexpected refresh error: %s", e)
-            self._set_icon(ICON_ERROR)
-            rumps.notification("ATVLoader", "Refresh failed", str(e))
-            self._rebuild()
+            self._set_icon_async(ICON_ERROR)
+            self._notify_async("ATVLoader", "Refresh failed", str(e))
+            self._reload_and_rebuild_async()
             return
 
-        # Restore state from disk so we have the latest timestamps
-        self.cfg = cfgmod.Config.load()
-        self._set_icon(previous_icon)  # will be re-derived by _refresh_icon
         if succeeded == 0 and failed == 0:
-            # Nothing needed refreshing
+            # No-op refresh (nothing was stale). Silent.
             pass
         elif failed == 0:
-            rumps.notification(
+            self._notify_async(
                 "ATVLoader",
                 "Refresh complete",
                 f"{succeeded} app{'s' if succeeded != 1 else ''} refreshed",
             )
         else:
-            rumps.notification(
+            self._notify_async(
                 "ATVLoader",
                 "Refresh partial",
                 f"{succeeded} succeeded, {failed} failed",
             )
-        self._rebuild()
+        self._reload_and_rebuild_async()
 
-    def _start_scheduler_thread(self) -> None:
-        """Hourly tick that calls the refresh check. The check itself
-        decides whether any IPAs actually need work (needs_refresh), so
-        this thread just keeps the clock running."""
+    def _reload_and_rebuild_async(self) -> None:
+        """Reload config from disk and rebuild the menu, on the main thread.
 
-        def loop() -> None:
-            while True:
-                time.sleep(HOURLY_TICK_SECONDS)
-                try:
-                    self._do_refresh(force=False)
-                except Exception as e:  # noqa: BLE001
-                    log.exception("hourly refresh tick failed: %s", e)
-
-        t = threading.Thread(target=loop, daemon=True, name="atvloader-hourly")
-        t.start()
+        After a refresh cycle completes, we want the icon to return to its
+        natural derived state (📺 / 📺⚠️ / 📺❌), NOT stay at 📺⏳. Do that
+        by rebuilding with respect_refreshing=False.
+        """
+        def _do() -> None:
+            try:
+                self.cfg = cfgmod.Config.load()
+                self._rebuild(respect_refreshing=False)
+            except Exception as e:  # noqa: BLE001
+                log.exception("reload-and-rebuild failed: %s", e)
+        _on_main_thread(_do)
 
     # --- wake-from-sleep hook ------------------------------------------------
 
@@ -565,7 +915,10 @@ class ATVLoaderApp(rumps.App):
         class _WakeObserver(NSObject):  # type: ignore[misc]
             def didWake_(self, _note: object) -> None:
                 log.info("system wake detected; kicking refresh check")
-                app_ref._background_check(force=False, delay=2.0)
+                try:
+                    app_ref._background_check(force=False)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("wake handler failed: %s", e)
 
         observer = _WakeObserver.alloc().init()
         center = NSWorkspace.sharedWorkspace().notificationCenter()

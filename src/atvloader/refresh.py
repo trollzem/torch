@@ -331,12 +331,18 @@ def refresh_all(
     cfg: Config,
     *,
     force: bool = False,
+    only: list[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> tuple[int, int]:
     """Refresh every tracked IPA that needs it. Returns (succeeded, failed).
 
+    If `only` is a list of filenames, only those IPAs are considered —
+    useful for the per-app "Refresh now" button. `force=True` bypasses
+    the freshness check so a manually-requested refresh always runs
+    (subject to the frozen-after-3-failures cap).
+
     Only one refresh runs at a time. Concurrent calls (e.g. hourly timer
-    fires while a manual "Refresh Now" is mid-run) no-op on the second
+    fires while a manual Refresh Now is mid-run) no-op on the second
     entry and return (0, 0).
     """
     if not _refresh_lock.acquire(blocking=False):
@@ -344,13 +350,19 @@ def refresh_all(
         return (0, 0)
 
     try:
-        return _refresh_all_locked(cfg, force=force, progress=progress)
+        return _refresh_all_locked(
+            cfg, force=force, only=only, progress=progress
+        )
     finally:
         _refresh_lock.release()
 
 
 def _refresh_all_locked(
-    cfg: Config, *, force: bool, progress: ProgressCallback | None
+    cfg: Config,
+    *,
+    force: bool,
+    only: list[str] | None,
+    progress: ProgressCallback | None,
 ) -> tuple[int, int]:
     def emit(msg: str) -> None:
         log.info(msg)
@@ -375,10 +387,13 @@ def _refresh_all_locked(
     cfg = reconcile_devices(cfg)
 
     interval = cfg.settings.refresh_interval_days
+    only_set = set(only) if only is not None else None
     candidates = [
         ipa
         for ipa in cfg.ipas
-        if not is_frozen(ipa) and (force or needs_refresh(ipa, interval))
+        if (only_set is None or ipa.filename in only_set)
+        and not is_frozen(ipa)
+        and (force or needs_refresh(ipa, interval))
     ]
     if not candidates:
         emit("nothing to refresh")
