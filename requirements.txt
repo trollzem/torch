@@ -1,3 +1,5 @@
-pymobiledevice3>=9.9.0
 rumps>=0.4.0
-cryptography>=46.0.0
+keyring>=24.0
+pexpect>=4.9
+pyobjc-framework-Cocoa>=10.0
+pymobiledevice3>=9.9.0
