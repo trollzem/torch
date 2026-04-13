@@ -134,17 +134,52 @@ def tunneld_plist() -> dict:
     }
 
 
+def _torch_app_executable() -> Path:
+    """Path to the py2app-built Torch.app stub launcher.
+
+    Prefers an installed copy at /Applications/Torch.app (what Step 2
+    of the install flow produces), falls back to the in-repo alias
+    build at <repo>/dist/Torch.app (what a dev workflow with
+    `python3 setup.py py2app -A` produces). Raises LaunchdError if
+    neither exists — install.py is responsible for ensuring one of
+    these is present before bootstrapping the LaunchAgent.
+    """
+    candidates = [
+        Path("/Applications/Torch.app/Contents/MacOS/Torch"),
+        paths.PROJECT_ROOT / "dist" / "Torch.app" / "Contents" / "MacOS" / "Torch",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise LaunchdError(
+        "No Torch.app found. Build it first with "
+        "`python3 setup.py py2app -A` (dev) or "
+        "`python3 setup.py py2app` (release) before installing "
+        "the LaunchAgent."
+    )
+
+
 def app_plist() -> dict:
-    """Return the plist dict for the menubar LaunchAgent."""
-    python_bin = str(_current_python())
-    project_src = str(paths.PROJECT_ROOT / "src")
+    """Return the plist dict for the menubar LaunchAgent.
+
+    ProgramArguments points at the py2app-built Torch.app stub
+    launcher, not `python3 -m torchapp`. Running the stub directly
+    is what gives the process a proper CFBundleIdentifier
+    (com.torch.app) so notifications attribute to "Torch" rather
+    than "Python". See `_torch_app_executable` for the search path.
+
+    PYTHONPATH is deliberately NOT set here — the py2app bundle has
+    its own sys.path via __boot__.py, and leaking PYTHONPATH would
+    cause the bundle to pick up the system site-packages on top of
+    its own (which can cause version skew in rumps / pyobjc).
+    """
+    torch_bin = str(_torch_app_executable())
     logs_dir = paths.LOG_DIR
     logs_dir.mkdir(parents=True, exist_ok=True)
     return {
         "Label": APP_LABEL,
-        "ProgramArguments": [python_bin, "-m", "torchapp"],
+        "ProgramArguments": [torch_bin],
         "EnvironmentVariables": {
-            "PYTHONPATH": project_src,
             "HOME": str(Path.home()),
             # Inherit PATH so subprocess calls to plumesign, pymobiledevice3,
             # zip, osascript, security, codesign, etc. all resolve the same

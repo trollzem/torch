@@ -12,11 +12,17 @@
 #   1. Installs Homebrew if missing.
 #   2. Installs python@3.14 via brew.
 #   3. Clones Torch to ~/torch (or uses an existing checkout).
-#   4. Installs Python dependencies (rumps, keyring, pexpect, pyobjc, pymobiledevice3).
+#   4. Installs Python dependencies (rumps, keyring, pexpect, pyobjc,
+#      pymobiledevice3, py2app).
 #   5. Verifies the bundled patched plumesign binary is present (or rebuilds from source).
-#   6. Installs the launchd services (LaunchDaemon for tunneld, LaunchAgent for menubar).
-#      This is the single sudo moment — macOS's native admin dialog will ask once.
-#   7. Tells you how to log in and pair your first device from the menubar.
+#   6. Builds Torch.app via py2app and copies it to /Applications/Torch.app.
+#      Bundling is what gives the process a proper CFBundleIdentifier so
+#      notifications attribute to "Torch" instead of "Python".
+#   7. Installs the launchd services (LaunchDaemon for tunneld, LaunchAgent for menubar).
+#      The LaunchAgent runs /Applications/Torch.app/Contents/MacOS/Torch directly.
+#      This is the single sudo moment — macOS's native admin dialog will ask once
+#      for the LaunchDaemon (tunneld); the LaunchAgent and bundle install don't need it.
+#   8. Tells you how to log in and pair your first device from the menubar.
 #
 # The script is idempotent — running it again on an existing install does a
 # `git pull` and re-bootstraps everything, skipping steps that are already done.

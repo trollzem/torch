@@ -3,3 +3,8 @@ keyring>=24.0
 pexpect>=4.9
 pyobjc-framework-Cocoa>=10.0
 pymobiledevice3>=9.9.0
+
+# Build-time only: py2app packages torchapp as a proper .app bundle
+# so notifications and LaunchServices attribute to "Torch" instead of
+# the generic "Python" hosting bundle. Not imported at runtime.
+py2app>=0.28.10

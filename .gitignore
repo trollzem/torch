@@ -10,6 +10,10 @@ ipas/
 *.pem
 .DS_Store
 
+# py2app build artifacts
+build/
+dist/
+
 # Local engineering notes — stays on disk for development but never
 # ships to the public repo. Documented at the top of the file itself.
 CLAUDE.md

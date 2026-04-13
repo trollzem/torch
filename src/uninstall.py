@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Uninstaller: bootout + remove both launchd plists.
+"""Uninstaller: bootout + remove both launchd plists + the .app bundle.
 
 Usage:
     python3 src/uninstall.py           # remove both
     python3 src/uninstall.py --agent   # remove LaunchAgent only
     python3 src/uninstall.py --daemon  # remove LaunchDaemon only (sudo)
+
+Also removes /Applications/Torch.app (the py2app-built bundle) when
+--agent is passed.
 
 Does NOT touch:
   - ~/Library/Application Support/Torch/   (config, IPAs, logs)
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -26,6 +30,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from torchapp import launchd  # noqa: E402
+
+APPLICATIONS_APP = Path("/Applications/Torch.app")
+DIST_APP = HERE.parent / "dist" / "Torch.app"
 
 
 def main() -> int:
@@ -51,6 +58,12 @@ def main() -> int:
             launchd.uninstall_launch_agent()
         except launchd.LaunchdError as e:
             print(f"[!] {e}", file=sys.stderr)
+        if APPLICATIONS_APP.exists():
+            print(f"[+] Removing {APPLICATIONS_APP}")
+            shutil.rmtree(APPLICATIONS_APP)
+        if DIST_APP.exists():
+            print(f"[+] Removing {DIST_APP}")
+            shutil.rmtree(DIST_APP)
 
     if args.daemon:
         print("[+] Removing tunneld LaunchDaemon (requires admin password)")
