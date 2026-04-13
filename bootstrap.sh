@@ -157,6 +157,16 @@ fi
 
 log "Patched plumesign binary is present"
 
+# Pre-create ~/.pymobiledevice3 with user ownership BEFORE the launchd
+# step runs. The tunneld LaunchDaemon starts as root with HOME set to
+# the user's home, and on first start pymobiledevice3's pair_records
+# module does `Path.home() / ".pymobiledevice3"` + mkdir(exist_ok=True),
+# which creates the directory owned by root. After that the user's
+# own pair command can't write to it and fails with EACCES. Creating
+# it first under user ownership means root just uses the existing
+# directory.
+mkdir -p "$HOME/.pymobiledevice3"
+
 # ---------------------------------------------------------------------------
 #  Step 7: Apple ID login (interactive, one-time)
 # ---------------------------------------------------------------------------

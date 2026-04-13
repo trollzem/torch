@@ -835,21 +835,25 @@ class TorchApp(rumps.App):
         # Open Terminal running the pairing command. Using osascript so
         # Terminal.app is brought to the foreground cleanly.
         #
-        # We must use the absolute path to the venv's pymobiledevice3
-        # binary rather than a bare command name. The menubar process
-        # runs under a LaunchAgent with PATH pointing at the venv bin,
-        # but when we ask Terminal.app to launch a new window, that
-        # window inherits the user's normal shell PATH — which does
-        # NOT include .venv/bin. A bare `pymobiledevice3` resolves to
-        # "command not found" in the handoff terminal. The absolute
-        # path dodges the PATH problem entirely.
-        pymd3_bin = str(
-            Path(sys.executable).parent / "pymobiledevice3"
-        )
+        # We run `python3 -m torchapp.pair_helper` instead of the bare
+        # `pymobiledevice3 remote pair` CLI because the latter shows
+        # one menu row per (device, interface) pair — 6-8 visually-
+        # identical entries for a single Apple TV with IPv4 + IPv6 ULA
+        # + link-local. pair_helper deduplicates by identifier and
+        # prefers the IPv4 address, so the user goes straight to the
+        # PIN prompt with no menu.
+        #
+        # Absolute paths for both the venv Python AND the repo root
+        # are required: the Terminal window inherits the user's
+        # default shell PATH / cwd, not the LaunchAgent's, so bare
+        # commands or relative paths resolve incorrectly.
+        venv_python = str(Path(sys.executable))
+        repo_root = str(paths.PROJECT_ROOT)
         script = (
             'tell application "Terminal" to activate\n'
             'tell application "Terminal" to do script '
-            f'"{pymd3_bin} remote pair; '
+            f'"cd \'{repo_root}\' && '
+            f'PYTHONPATH=src \'{venv_python}\' -m torchapp.pair_helper; '
             'echo; echo \\"Pairing finished. You can close this window.\\""'
         )
         subprocess.run(["osascript", "-e", script])
