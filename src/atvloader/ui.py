@@ -98,6 +98,9 @@ ICON_STALE = "📺⚠️"
 ICON_ERROR = "📺❌"
 
 HOURLY_TICK_SECONDS = 3600.0
+# How often to check for external config mutations (IPA file drops,
+# config.json edits from another process). Cheap on-disk I/O only.
+CONFIG_WATCH_SECONDS = 5.0
 
 # Free Apple ID provisioning profiles live for 7 days from the moment
 # the profile is issued (which is also the moment we sign the IPA).
@@ -162,6 +165,7 @@ class ATVLoaderApp(rumps.App):
         self.cfg: Config = cfgmod.bootstrap()
         self._state_lock = threading.Lock()
         self._icon_state: str = ICON_IDLE
+        self._last_config_mtime = self._config_mtime()
         self._build_menu()
         # rumps.Timer runs its callback on the main thread, which is
         # exactly what we need for anything that touches self.menu /
@@ -169,6 +173,13 @@ class ATVLoaderApp(rumps.App):
         # at the given interval; calling .start() arms it.
         self._hourly_timer = rumps.Timer(self._on_hourly_tick, HOURLY_TICK_SECONDS)
         self._hourly_timer.start()
+        # Cheap file-mtime watcher so external config mutations (another
+        # process signing an IPA, a user dropping a file into the ipas/
+        # folder) show up in the menu without having to trigger a refresh.
+        self._config_watch_timer = rumps.Timer(
+            self._on_config_watch_tick, CONFIG_WATCH_SECONDS
+        )
+        self._config_watch_timer.start()
         self._install_wake_observer()
         # Kick off an initial refresh check shortly after launch via a
         # one-shot timer so it runs on the main thread (which then
@@ -176,6 +187,52 @@ class ATVLoaderApp(rumps.App):
         # _background_check).
         self._initial_kick = rumps.Timer(self._on_initial_kick, 2.0)
         self._initial_kick.start()
+
+    def _config_mtime(self) -> float:
+        try:
+            return paths.CONFIG_FILE.stat().st_mtime
+        except FileNotFoundError:
+            return 0.0
+
+    def _on_config_watch_tick(self, _timer: object) -> None:
+        """Detect external changes to config.json or the IPAs folder.
+
+        Runs on the main thread every CONFIG_WATCH_SECONDS. Cheap: a
+        stat + optional directory scan + dict comparison. If anything
+        changed, we reload config, run sync_ipas_folder (picks up new
+        files dropped into the folder), save if needed, and rebuild
+        the menu. No refresh is triggered — that's still only on the
+        hourly timer or explicit user action.
+        """
+        current_mtime = self._config_mtime()
+        config_changed = current_mtime != self._last_config_mtime
+
+        # Also check for new/removed files in the IPAs folder even if
+        # config.json itself hasn't been touched.
+        on_disk = set()
+        try:
+            on_disk = {p.name for p in paths.IPAS_DIR.glob("*.ipa")}
+        except OSError:
+            pass
+        tracked_set = {i.filename for i in self.cfg.ipas}
+        folder_changed = on_disk != tracked_set
+
+        if not config_changed and not folder_changed:
+            return
+
+        log.debug(
+            "config watcher saw change (mtime=%s folder=%s); reloading",
+            config_changed,
+            folder_changed,
+        )
+        try:
+            self.cfg = cfgmod.Config.load()
+            if cfgmod.sync_ipas_folder(self.cfg):
+                self.cfg.save()
+            self._last_config_mtime = self._config_mtime()
+            self._rebuild()
+        except Exception as e:  # noqa: BLE001
+            log.exception("config watcher rebuild failed: %s", e)
 
     # --- menu wiring ---------------------------------------------------------
 
