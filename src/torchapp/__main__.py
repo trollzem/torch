@@ -1,4 +1,4 @@
-"""Entry point: `python3 -m atvloader` launches the menubar app."""
+"""Entry point: `python3 -m torchapp` launches the menubar app."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import logging
 import sys
 
 from . import paths
-from .ui import ATVLoaderApp
+from .ui import TorchApp
 
 
 def _setup_logging() -> None:
@@ -23,14 +23,14 @@ def _setup_logging() -> None:
         level=logging.INFO,
         handlers=[handler, stderr_handler],
     )
-    logging.getLogger("atvloader").info(
-        "ATVLoader starting; log file at %s", paths.LOG_FILE
+    logging.getLogger("torch").info(
+        "Torch starting; log file at %s", paths.LOG_FILE
     )
 
 
 def main() -> None:
     _setup_logging()
-    app = ATVLoaderApp()
+    app = TorchApp()
     app.run()
 
 

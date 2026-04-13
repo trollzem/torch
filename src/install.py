@@ -7,14 +7,14 @@ Usage:
     python3 src/install.py --daemon  # install LaunchDaemon only (sudo)
 
 On first run:
-  1. Installs com.atvloader.tunneld as a root LaunchDaemon so the
+  1. Installs com.torch.tunneld as a root LaunchDaemon so the
      WiFi tunnel to Apple TV / iOS devices starts at boot and
      respawns on crash. This is the single admin-password moment.
-  2. Installs com.atvloader.app as a user LaunchAgent so the
+  2. Installs com.torch.app as a user LaunchAgent so the
      menubar app auto-starts at login and respawns on crash.
 
 Any already-running pymobiledevice3 tunneld process or python3 -m
-atvloader instance is killed first so the new launchd-managed
+torchapp instance is killed first so the new launchd-managed
 versions take over cleanly.
 
 Idempotent — re-running the script bootout + re-bootstraps both
@@ -29,12 +29,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Make `atvloader` importable when run from the project root without
+# Make `torchapp` importable when run from the project root without
 # having to remember PYTHONPATH on the command line.
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from atvloader import launchd, paths  # noqa: E402
+from torchapp import launchd, paths  # noqa: E402
 
 
 def _setup_logging() -> None:
@@ -50,9 +50,9 @@ def _kill_stray_processes() -> None:
     We do this before install so the launchd bootstrap doesn't race
     against a manually-started copy that would bind the same sockets.
     """
-    # Menubar app: kill any "Python -m atvloader" we find
+    # Menubar app: kill any "Python -m torchapp" currently running.
     subprocess.run(
-        ["pkill", "-9", "-f", "Python.*-m atvloader"],
+        ["pkill", "-9", "-f", "Python.*-m torchapp"],
         capture_output=True,
     )
     # Stray tunneld: pymobiledevice3 remote tunneld run without launchd
@@ -64,7 +64,7 @@ def _kill_stray_processes() -> None:
 
 def main() -> int:
     _setup_logging()
-    parser = argparse.ArgumentParser(description="Install ATVLoader launchd services")
+    parser = argparse.ArgumentParser(description="Install Torch launchd services")
     parser.add_argument(
         "--agent",
         action="store_true",
@@ -96,14 +96,14 @@ def main() -> int:
         print(f"[+] {launchd.TUNNELD_LABEL} is running as a system service")
 
     if args.agent:
-        print("[+] Installing ATVLoader menubar LaunchAgent")
+        print("[+] Installing Torch menubar LaunchAgent")
         try:
             launchd.install_launch_agent()
         except launchd.LaunchdError as e:
             print(f"[!] LaunchAgent install failed: {e}", file=sys.stderr)
             return 2
         print(
-            f"[+] {launchd.APP_LABEL} is running — look for the 📺 icon "
+            f"[+] {launchd.APP_LABEL} is running — look for the 🔥 flame icon "
             f"in your menubar"
         )
 

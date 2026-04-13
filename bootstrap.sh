@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# ATVLoader bootstrap — one-command install for a fresh macOS machine.
+# Torch bootstrap — one-command install for a fresh macOS machine.
 #
 # Usage (new Mac, never seen this repo):
-#   curl -fsSL https://raw.githubusercontent.com/YOURUSER/ATVLoader/main/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/trollzem/torch/main/bootstrap.sh | bash
 #
 # Usage (already have the repo cloned somewhere):
-#   cd /path/to/ATVLoader && ./bootstrap.sh
+#   cd /path/to/torch && ./bootstrap.sh
 #
 # What this does:
 #   1. Installs Homebrew if missing.
 #   2. Installs python@3.14 via brew.
-#   3. Clones ATVLoader to ~/ATVLoader (or uses an existing checkout).
+#   3. Clones Torch to ~/torch (or uses an existing checkout).
 #   4. Installs Python dependencies (rumps, keyring, pexpect, pyobjc, pymobiledevice3).
 #   5. Verifies the bundled patched plumesign binary is present (or rebuilds from source).
 #   6. Prompts for Apple ID login (one-time, interactive — email + password + 2FA).
@@ -23,10 +23,10 @@
 # `git pull` and re-bootstraps everything, skipping steps that are already done.
 #
 # After this completes:
-#   - 📺 icon appears in your menubar
+#   - 🔥 flame icon appears in your menubar
 #   - tunneld runs at boot as a root LaunchDaemon
 #   - menubar auto-starts at login
-#   - drop IPAs into ~/Library/Application Support/ATVLoader/ipas/ (or click
+#   - drop IPAs into ~/Library/Application Support/Torch/ipas/ (or click
 #     "Add IPA..." in the menubar) and they refresh automatically every 6 days
 
 set -euo pipefail
@@ -35,8 +35,8 @@ set -euo pipefail
 #  Config
 # ---------------------------------------------------------------------------
 
-REPO_URL="${ATVLOADER_REPO:-https://github.com/YOURUSER/ATVLoader.git}"
-TARGET_DIR="${ATVLOADER_DIR:-$HOME/ATVLoader}"
+REPO_URL="${TORCH_REPO:-https://github.com/trollzem/torch.git}"
+TARGET_DIR="${TORCH_DIR:-$HOME/torch}"
 
 # ---------------------------------------------------------------------------
 #  Helpers
@@ -55,7 +55,7 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 # If this script is being run from inside an existing checkout (the user cd'd
 # into the repo and ran ./bootstrap.sh), use that instead of cloning again.
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]:-$0}" )" && pwd )" 2>/dev/null || SCRIPT_DIR=""
-if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/bootstrap.sh" ] && [ -d "$SCRIPT_DIR/src/atvloader" ]; then
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/bootstrap.sh" ] && [ -d "$SCRIPT_DIR/src/torchapp" ]; then
     TARGET_DIR="$SCRIPT_DIR"
     log "Using existing checkout at $TARGET_DIR"
 fi
@@ -91,7 +91,7 @@ brew list python@3.14 >/dev/null 2>&1 || brew install python@3.14
 # ---------------------------------------------------------------------------
 
 if [ ! -d "$TARGET_DIR" ]; then
-    log "Cloning ATVLoader to $TARGET_DIR"
+    log "Cloning Torch to $TARGET_DIR"
     git clone "$REPO_URL" "$TARGET_DIR"
 elif [ -d "$TARGET_DIR/.git" ]; then
     log "Updating existing checkout"
@@ -174,7 +174,7 @@ if [ -d "$HOME/.pymobiledevice3" ]; then
 fi
 
 echo
-log "Done. Look for the 📺 icon in your menubar."
+log "Done. Look for the 🔥 flame icon in your menubar."
 echo
 
 if [ "$pair_count" -eq 0 ]; then
@@ -184,17 +184,17 @@ No devices are paired yet. To add your first one:
   Apple TV:
     1. On the Apple TV: Settings → General → Remotes and Devices →
        Remote App and Devices. Leave that screen open.
-    2. Click the 📺 menubar icon → Devices → Add Apple TV
+    2. Click the 🔥 flame menubar icon → Devices → Add Apple TV
        (pair via Terminal). Follow the 6-digit PIN prompt.
 
   iPhone / iPad:
     1. Plug the device in via USB cable. Tap "Trust This Computer"
        when it appears on the device screen.
-    2. Click the 📺 menubar icon → Devices → Detect iPhone/iPad
+    2. Click the 🔥 flame menubar icon → Devices → Detect iPhone/iPad
        (via USB trust). Accept the "Add this device?" dialog.
 
-Then drop IPAs into ~/Library/Application Support/ATVLoader/ipas/
-(or click 📺 → Apps → Add IPA...) and they'll auto-refresh every 6 days.
+Then drop IPAs into ~/Library/Application Support/Torch/ipas/
+(or click the 🔥 flame → Apps → Add IPA...) and they'll auto-refresh every 6 days.
 EOF
 else
     log "$pair_count device(s) already paired — nothing else to do."

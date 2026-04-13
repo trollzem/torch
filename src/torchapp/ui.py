@@ -9,11 +9,15 @@ State model:
     so UI callbacks (Refresh Now button, hourly timer, wake handler)
     can't stomp on each other.
 
-The menubar title icon reflects the overall state:
-  📺 idle - all apps fresh
-  📺⏳ refreshing right now
-  📺⚠️ stale (at least one app needs refresh and isn't frozen)
-  📺❌ error (last run failed or tunneld is down)
+The menubar icon reflects the overall state via an SF Symbol template
+image rendered into ~/Library/Application Support/Torch/icons/ at
+first launch:
+  idle         flame.fill                      all apps fresh
+  refreshing   arrow.triangle.2.circlepath     sign/install in progress
+  stale        exclamationmark.triangle.fill   at least one IPA needs refresh
+  error        xmark.octagon.fill              tunneld down / cert dead / etc
+
+See `icons.py` for the SF Symbol names and the rendering pipeline.
 
 All text labels are updated by rebuilding the menu from config state
 after every event that changes state (refresh done, config edited,
@@ -37,7 +41,7 @@ except ImportError:  # pragma: no cover
     AppHelper = None  # type: ignore[assignment]
 
 from . import config as cfgmod
-from . import pairing, paths, plumesign, pymd3, refresh
+from . import icons, pairing, paths, plumesign, pymd3, refresh
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -92,10 +96,22 @@ def _run_on_main_and_wait(func, *args, **kwargs):  # type: ignore[no-untyped-def
     return result.get("value")
 
 
-ICON_IDLE = "📺"
-ICON_REFRESHING = "📺⏳"
-ICON_STALE = "📺⚠️"
-ICON_ERROR = "📺❌"
+# State keys used by icons.ensure_menubar_icons(). These double as
+# the string values we store in self._icon_state so we can detect
+# "is the menubar currently showing refreshing?" in _refresh_icon.
+ICON_IDLE = icons.STATE_IDLE
+ICON_REFRESHING = icons.STATE_REFRESHING
+ICON_STALE = icons.STATE_STALE
+ICON_ERROR = icons.STATE_ERROR
+
+# Emoji fallbacks used only if SF Symbol rendering failed at startup
+# (e.g. on a macOS version that doesn't ship the expected symbols).
+_EMOJI_FALLBACK: dict[str, str] = {
+    ICON_IDLE: "🔥",
+    ICON_REFRESHING: "🔥⏳",
+    ICON_STALE: "🔥⚠️",
+    ICON_ERROR: "🔥❌",
+}
 
 HOURLY_TICK_SECONDS = 3600.0
 # How often to check for external config mutations (IPA file drops,
@@ -177,13 +193,29 @@ def _format_cert_expiry(iso: str | None) -> str:
     return f"{delta.days} days left"
 
 
-class ATVLoaderApp(rumps.App):
+class TorchApp(rumps.App):
     def __init__(self) -> None:
-        super().__init__(
-            "ATVLoader",
-            title=ICON_IDLE,
-            quit_button=None,
-        )
+        # Render SF Symbol icons before super().__init__ so we can
+        # pass the idle icon path directly to rumps.App. If symbol
+        # rendering fails for any reason we fall back to emoji titles.
+        self._icon_paths: dict[str, Path | None] = icons.ensure_menubar_icons()
+        idle_path = self._icon_paths.get(ICON_IDLE)
+
+        if idle_path is not None:
+            super().__init__(
+                "Torch",
+                icon=str(idle_path),
+                template=True,
+                title=None,
+                quit_button=None,
+            )
+        else:
+            super().__init__(
+                "Torch",
+                title=_EMOJI_FALLBACK[ICON_IDLE],
+                quit_button=None,
+            )
+
         self.cfg: Config = cfgmod.bootstrap()
         self._state_lock = threading.Lock()
         self._icon_state: str = ICON_IDLE
@@ -446,11 +478,21 @@ class ATVLoaderApp(rumps.App):
         )
 
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Quit ATVLoader", callback=rumps.quit_application))
+        self.menu.add(rumps.MenuItem("Quit Torch", callback=rumps.quit_application))
 
-    def _set_icon(self, icon: str) -> None:
-        self._icon_state = icon
-        self.title = icon
+    def _set_icon(self, state: str) -> None:
+        """Swap the menubar icon to the given state ('idle', 'refreshing',
+        'stale', 'error'). Uses the rendered SF Symbol PNG if available,
+        falls back to an emoji title if rendering failed at startup.
+        """
+        self._icon_state = state
+        path = self._icon_paths.get(state) if self._icon_paths else None
+        if path is not None:
+            self.icon = str(path)
+            self.title = None
+        else:
+            self.icon = None
+            self.title = _EMOJI_FALLBACK.get(state, _EMOJI_FALLBACK[ICON_IDLE])
 
     def _rebuild(self, *, respect_refreshing: bool = False) -> None:
         """Rebuild menu + icon from current config.
@@ -458,9 +500,10 @@ class ATVLoaderApp(rumps.App):
         MUST be called on the main thread. Use _rebuild_async() from
         worker threads.
 
-        When `respect_refreshing` is True, the icon is left at 📺⏳ if
-        a refresh is currently in progress. We use that during mid-
-        refresh rebuilds so the progress indicator doesn't flicker.
+        When `respect_refreshing` is True, the icon is left at the
+        refreshing-state symbol if a refresh is currently in progress.
+        We use that during mid-refresh rebuilds so the progress
+        indicator doesn't flicker away to idle and back.
         """
         try:
             self._build_menu()
@@ -492,7 +535,7 @@ class ATVLoaderApp(rumps.App):
 
         When `respect_refreshing` is True, a refresh-in-progress icon is
         left alone so the menu rebuilds mid-refresh don't flicker the
-        icon away from 📺⏳. When the refresh completes we call this
+        icon away from the refreshing symbol. When the refresh completes we call this
         with respect_refreshing=False to reset the icon to whatever the
         config now warrants.
         """
@@ -534,7 +577,7 @@ class ATVLoaderApp(rumps.App):
             target=self._do_refresh_worker,
             kwargs={"force": True, "only": [filename]},
             daemon=True,
-            name=f"atvloader-refresh-{filename}",
+            name=f"torch-refresh-{filename}",
         ).start()
 
     def _remove_ipa(self, filename: str) -> None:
@@ -545,7 +588,7 @@ class ATVLoaderApp(rumps.App):
         if rumps.alert(
             title="Remove IPA?",
             message=(
-                f"Stop tracking {filename} and delete it from the ATVLoader "
+                f"Stop tracking {filename} and delete it from the Torch "
                 f"IPAs folder? The signed copy on your devices will not be "
                 f"uninstalled."
             ),
@@ -570,7 +613,7 @@ class ATVLoaderApp(rumps.App):
         self.cfg.save()
         self._rebuild()
         rumps.notification(
-            "ATVLoader", "IPA removed", f"{filename} is no longer tracked."
+            "Torch", "IPA removed", f"{filename} is no longer tracked."
         )
 
     def on_toggle_pause(self, _sender: object) -> None:
@@ -586,7 +629,7 @@ class ATVLoaderApp(rumps.App):
             if self.cfg.settings.auto_refresh_paused
             else "Auto-refresh resumed"
         )
-        rumps.notification("ATVLoader", "Settings", msg)
+        rumps.notification("Torch", "Settings", msg)
 
     def _on_hourly_tick(self, _timer: object) -> None:
         """rumps.Timer callback — runs on main thread, delegates to worker."""
@@ -604,7 +647,7 @@ class ATVLoaderApp(rumps.App):
         # tick, or the IPAs-folder sync at next app start) picks them up.
         subprocess.run(["open", str(paths.IPAS_DIR)])
         rumps.notification(
-            "ATVLoader",
+            "Torch",
             "Add an IPA",
             "Drop .ipa files into the folder that just opened, then click "
             "'Refresh Now' to pick them up.",
@@ -650,7 +693,7 @@ class ATVLoaderApp(rumps.App):
             rumps.alert(
                 title="No new devices",
                 message=(
-                    "Tunneld doesn't see any devices that ATVLoader "
+                    "Tunneld doesn't see any devices that Torch "
                     "isn't already tracking.\n\n"
                     "If your iPhone or iPad isn't showing up, plug it "
                     "in with a USB cable and tap 'Trust This Computer' "
@@ -711,7 +754,7 @@ class ATVLoaderApp(rumps.App):
 
             prompt = (
                 f"Found: {name}{class_info}\n\n"
-                f"Add this device to ATVLoader? All tracked IPAs will "
+                f"Add this device to Torch? All tracked IPAs will "
                 f"be auto-targeted at it."
             )
             if rumps.alert(
@@ -738,7 +781,7 @@ class ATVLoaderApp(rumps.App):
             self.cfg.save()
             self._rebuild()
             rumps.notification(
-                "ATVLoader",
+                "Torch",
                 "Device added",
                 f"{added_count} device{'s' if added_count != 1 else ''} "
                 f"added. They'll be refreshed on the next cycle.",
@@ -801,7 +844,7 @@ class ATVLoaderApp(rumps.App):
         subprocess.run(["osascript", "-e", script])
 
         rumps.notification(
-            "ATVLoader",
+            "Torch",
             "Pairing in progress",
             "Enter the 6-digit code in the Terminal window that just "
             "opened. I'll pick up the new device automatically.",
@@ -818,7 +861,7 @@ class ATVLoaderApp(rumps.App):
             log.info("pairing deadline reached; stopping poll")
             self._pairing_timer.stop()
             rumps.notification(
-                "ATVLoader",
+                "Torch",
                 "Pairing timed out",
                 "No new device appeared in the last 3 minutes. "
                 "If you finished the pairing in Terminal, click "
@@ -847,7 +890,7 @@ class ATVLoaderApp(rumps.App):
             target=self._post_pair_reconcile_worker,
             args=(new_pair_id,),
             daemon=True,
-            name="atvloader-post-pair",
+            name="torch-post-pair",
         ).start()
 
     def _post_pair_reconcile_worker(self, pair_id: str) -> None:
@@ -858,14 +901,14 @@ class ATVLoaderApp(rumps.App):
         except Exception as e:  # noqa: BLE001
             log.exception("post-pair reconcile failed: %s", e)
             self._notify_async(
-                "ATVLoader",
+                "Torch",
                 "Pairing incomplete",
                 f"Pair record saved but registration failed: {e}",
             )
             return
 
         self._notify_async(
-            "ATVLoader",
+            "Torch",
             "Device added",
             "The new device is ready to receive app refreshes.",
         )
@@ -953,7 +996,7 @@ class ATVLoaderApp(rumps.App):
             self._do_refresh_worker(force=force)
 
         t = threading.Thread(
-            target=run, daemon=True, name="atvloader-refresh-worker"
+            target=run, daemon=True, name="torch-refresh-worker"
         )
         t.start()
 
@@ -976,13 +1019,13 @@ class ATVLoaderApp(rumps.App):
         except refresh.RefreshAborted as e:
             log.warning("refresh aborted: %s", e)
             self._set_icon_async(ICON_ERROR)
-            self._notify_async("ATVLoader", "Refresh aborted", str(e))
+            self._notify_async("Torch", "Refresh aborted", str(e))
             self._reload_and_rebuild_async()
             return
         except Exception as e:  # noqa: BLE001
             log.exception("unexpected refresh error: %s", e)
             self._set_icon_async(ICON_ERROR)
-            self._notify_async("ATVLoader", "Refresh failed", str(e))
+            self._notify_async("Torch", "Refresh failed", str(e))
             self._reload_and_rebuild_async()
             return
 
@@ -991,13 +1034,13 @@ class ATVLoaderApp(rumps.App):
             pass
         elif failed == 0:
             self._notify_async(
-                "ATVLoader",
+                "Torch",
                 "Refresh complete",
                 f"{succeeded} app{'s' if succeeded != 1 else ''} refreshed",
             )
         else:
             self._notify_async(
-                "ATVLoader",
+                "Torch",
                 "Refresh partial",
                 f"{succeeded} succeeded, {failed} failed",
             )
@@ -1007,7 +1050,8 @@ class ATVLoaderApp(rumps.App):
         """Reload config from disk and rebuild the menu, on the main thread.
 
         After a refresh cycle completes, we want the icon to return to its
-        natural derived state (📺 / 📺⚠️ / 📺❌), NOT stay at 📺⏳. Do that
+        natural derived state (idle / stale / error), NOT stay at
+        the refreshing symbol. Do that
         by rebuilding with respect_refreshing=False.
         """
         def _do() -> None:

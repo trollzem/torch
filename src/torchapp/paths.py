@@ -9,10 +9,10 @@ during seeding and first-run detection, never write.
 
 from pathlib import Path
 
-APP_SUPPORT_DIR = Path("~/Library/Application Support/ATVLoader").expanduser()
+APP_SUPPORT_DIR = Path("~/Library/Application Support/Torch").expanduser()
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 LOG_DIR = APP_SUPPORT_DIR / "logs"
-LOG_FILE = LOG_DIR / "atvloader.log"
+LOG_FILE = LOG_DIR / "torch.log"
 IPAS_DIR = APP_SUPPORT_DIR / "ipas"
 SIGNED_DIR = APP_SUPPORT_DIR / "signed"
 

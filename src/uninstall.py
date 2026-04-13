@@ -7,10 +7,10 @@ Usage:
     python3 src/uninstall.py --daemon  # remove LaunchDaemon only (sudo)
 
 Does NOT touch:
-  - ~/Library/Application Support/ATVLoader/   (config, IPAs, logs)
+  - ~/Library/Application Support/Torch/   (config, IPAs, logs)
   - ~/.config/PlumeImpactor/                   (plumesign session)
   - ~/.pymobiledevice3/                        (pair records)
-  - the macOS Keychain entry for com.atvloader.appleid
+  - the macOS Keychain entry for com.torch.appleid
 
 Use `rm -rf` on those yourself if you want a truly clean slate.
 """
@@ -25,7 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from atvloader import launchd  # noqa: E402
+from torchapp import launchd  # noqa: E402
 
 
 def main() -> int:
@@ -33,7 +33,7 @@ def main() -> int:
         level=logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    parser = argparse.ArgumentParser(description="Uninstall ATVLoader launchd services")
+    parser = argparse.ArgumentParser(description="Uninstall Torch launchd services")
     parser.add_argument(
         "--agent", action="store_true", help="Only remove the user LaunchAgent"
     )
@@ -60,7 +60,7 @@ def main() -> int:
             print(f"[!] {e}", file=sys.stderr)
             return 2
 
-    print("Done. User data in ~/Library/Application Support/ATVLoader/ is untouched.")
+    print("Done. User data in ~/Library/Application Support/Torch/ is untouched.")
     return 0
 
 

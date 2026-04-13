@@ -28,7 +28,7 @@ class Device:
     # UUID of the pair record on disk (remote_<this>.plist). This is also
     # the key tunneld uses to address the device. Stable across runs.
     pair_record_identifier: str
-    # Apple-assigned UDID like "00008110-000E59EC3E41801E". Not present in
+    # Apple-assigned UDID like "00008110-XXXXXXXXXXXXXXXX". Not present in
     # the pair record file itself — must be discovered at runtime by
     # querying `pymobiledevice3 lockdown info` through the tunnel. Starts
     # as None on fresh seeding and is backfilled during reconciliation.
@@ -192,8 +192,8 @@ def _preferred_backup_dir() -> Path:
     """Return the directory where we mirror pair records + config.
 
     Prefers iCloud Drive if it exists (so a Mac restore puts everything
-    back); otherwise falls back to ~/Documents/ATVLoader-Backup/. Pair
-    records are the single hardest-to-recover piece of ATVLoader state
+    back); otherwise falls back to ~/Documents/Torch-Backup/. Pair
+    records are the single hardest-to-recover piece of Torch state
     (the Apple TV won't issue a new PIN without physically cycling its
     pairing screen), so protecting them across Mac loss is worth the
     5 minutes of work.
@@ -202,8 +202,8 @@ def _preferred_backup_dir() -> Path:
         Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
     )
     if icloud.exists() and icloud.is_dir():
-        return icloud / "ATVLoader" / "backup"
-    return Path.home() / "Documents" / "ATVLoader-Backup"
+        return icloud / "Torch" / "backup"
+    return Path.home() / "Documents" / "Torch-Backup"
 
 
 def backup_pair_records() -> int:

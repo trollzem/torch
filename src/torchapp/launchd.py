@@ -1,13 +1,13 @@
 """launchd plist generation + install/uninstall.
 
 Two services:
-  - com.atvloader.tunneld  System LaunchDaemon, runs as root.
+  - com.torch.tunneld  System LaunchDaemon, runs as root.
                            `pymobiledevice3 remote tunneld --wifi`
                            Starts at boot, respawns if killed.
                            Installs to /Library/LaunchDaemons/
                            Requires sudo to install/uninstall.
-  - com.atvloader.app      User LaunchAgent, runs as the logged-in user.
-                           `python3 -m atvloader`
+  - com.torch.app      User LaunchAgent, runs as the logged-in user.
+                           `python3 -m torchapp`
                            Starts at login, respawns if killed.
                            Installs to ~/Library/LaunchAgents/
 
@@ -33,8 +33,8 @@ from . import paths
 
 log = logging.getLogger(__name__)
 
-TUNNELD_LABEL = "com.atvloader.tunneld"
-APP_LABEL = "com.atvloader.app"
+TUNNELD_LABEL = "com.torch.tunneld"
+APP_LABEL = "com.torch.app"
 
 SYSTEM_LAUNCHDAEMONS_DIR = Path("/Library/LaunchDaemons")
 USER_LAUNCHAGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
@@ -42,8 +42,8 @@ USER_LAUNCHAGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 TUNNELD_PLIST_PATH = SYSTEM_LAUNCHDAEMONS_DIR / f"{TUNNELD_LABEL}.plist"
 APP_PLIST_PATH = USER_LAUNCHAGENTS_DIR / f"{APP_LABEL}.plist"
 
-TUNNELD_LOG_OUT = Path("/var/log/atvloader-tunneld.out")
-TUNNELD_LOG_ERR = Path("/var/log/atvloader-tunneld.err")
+TUNNELD_LOG_OUT = Path("/var/log/torch-tunneld.out")
+TUNNELD_LOG_ERR = Path("/var/log/torch-tunneld.err")
 
 
 class LaunchdError(Exception):
@@ -113,7 +113,7 @@ def app_plist() -> dict:
     logs_dir.mkdir(parents=True, exist_ok=True)
     return {
         "Label": APP_LABEL,
-        "ProgramArguments": [python_bin, "-m", "atvloader"],
+        "ProgramArguments": [python_bin, "-m", "torchapp"],
         "EnvironmentVariables": {
             "PYTHONPATH": project_src,
             "HOME": str(Path.home()),

@@ -15,7 +15,7 @@ from keyring.errors import PasswordDeleteError
 
 log = logging.getLogger(__name__)
 
-SERVICE_NAME = "com.atvloader.appleid"
+SERVICE_NAME = "com.torch.appleid"
 
 
 def set_password(email: str, password: str) -> None:

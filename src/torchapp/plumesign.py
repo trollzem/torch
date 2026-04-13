@@ -72,7 +72,7 @@ class RegisteredDevice:
     """A device as reported by Apple's developer portal (plumesign account devices)."""
     device_id: str          # Apple's internal ID (e.g. "2LGWFCR2DX")
     name: str
-    udid: str               # "00008110-000E59EC3E41801E"
+    udid: str               # "00008110-XXXXXXXXXXXXXXXX"
     device_platform: str    # "ios" (always, even for tvOS devices)
     device_class: str       # "tvOS" | "iPhone" | "iPad" | etc.
 
@@ -81,7 +81,7 @@ class RegisteredDevice:
 class AppIdInfo:
     """An app ID as reported by Apple's developer portal."""
     app_id_id: str
-    identifier: str         # "com.google.ios.youtube.3G6AP3U89B"
+    identifier: str         # "com.google.ios.youtube.TEAMID"
     name: str
 
 
@@ -89,7 +89,7 @@ class AppIdInfo:
 class CertInfo:
     """A development certificate as reported by Apple's portal."""
     certificate_id: str           # e.g. "G24N6XD9U6"
-    name: str                     # e.g. "iOS Development: eissahazem@gmail.com"
+    name: str                     # e.g. "iOS Development: your-apple-id@example.com"
     serial_number: str            # hex
     status: str                   # "Issued" | "Revoked" | ...
     expiration_date: datetime     # UTC
@@ -278,7 +278,7 @@ def list_app_ids() -> list[AppIdInfo]:
         AppID {
             id: "89Q828849P",
             attributes: AppIDAttributes {
-                identifier: "com.google.ios.youtube.3G6AP3U89B",
+                identifier: "com.google.ios.youtube.TEAMID",
                 ...
                 name: "YouTubeUnstable",
                 ...
