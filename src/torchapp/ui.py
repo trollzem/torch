@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -832,13 +833,23 @@ class TorchApp(rumps.App):
         } if paths.PYMD3_PAIR_RECORDS_DIR.exists() else set()
 
         # Open Terminal running the pairing command. Using osascript so
-        # Terminal.app is brought to the foreground cleanly. Any pre-
-        # existing pymobiledevice3 in PATH is fine — we rely on the
-        # same `pymobiledevice3` used everywhere else in the app.
+        # Terminal.app is brought to the foreground cleanly.
+        #
+        # We must use the absolute path to the venv's pymobiledevice3
+        # binary rather than a bare command name. The menubar process
+        # runs under a LaunchAgent with PATH pointing at the venv bin,
+        # but when we ask Terminal.app to launch a new window, that
+        # window inherits the user's normal shell PATH — which does
+        # NOT include .venv/bin. A bare `pymobiledevice3` resolves to
+        # "command not found" in the handoff terminal. The absolute
+        # path dodges the PATH problem entirely.
+        pymd3_bin = str(
+            Path(sys.executable).parent / "pymobiledevice3"
+        )
         script = (
             'tell application "Terminal" to activate\n'
             'tell application "Terminal" to do script '
-            '"pymobiledevice3 remote pair; '
+            f'"{pymd3_bin} remote pair; '
             'echo; echo \\"Pairing finished. You can close this window.\\""'
         )
         subprocess.run(["osascript", "-e", script])
