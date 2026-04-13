@@ -163,20 +163,37 @@ log "Patched plumesign binary is present"
 
 if [ ! -f "$HOME/.config/PlumeImpactor/accounts.json" ]; then
     log "Logging in to your Apple ID"
-    log "You'll be asked for your email, then password, then a 2FA code"
-    log "sent to a trusted device. This is a one-time step; the session"
-    log "is cached and subsequent signs don't re-prompt."
+    log "You'll enter your Apple ID email, then plumesign will prompt"
+    log "for your password and a 2FA code sent to a trusted device."
+    log "One-time step — the session is cached and subsequent signs"
+    log "don't re-prompt."
     echo
-    # When this script is run via `curl | bash`, bash inherits stdin
-    # from the pipe, which means plumesign's interactive prompts
-    # (Enter Apple ID email / password / 2FA code) all read EOF
-    # immediately instead of waiting for the user. Redirecting from
-    # /dev/tty points plumesign at the controlling terminal directly
-    # so the prompts actually work.
-    if [ ! -t 0 ] && [ -r /dev/tty ]; then
-        ./bin/plumesign account login < /dev/tty
+
+    # plumesign's LoginArgs struct has `arg_required_else_help = true`
+    # at the clap level, which means `plumesign account login` with no
+    # flags prints help and exits BEFORE the handler that would otherwise
+    # interactively prompt for email. We must pass -u explicitly.
+    #
+    # Bash reads the email from /dev/tty directly so it works under
+    # `curl | bash` (where the script's own stdin is the pipe, not a
+    # terminal). Then we pass it to plumesign with -u and redirect
+    # plumesign's own stdin from /dev/tty so its password + 2FA prompts
+    # can read the user's terminal.
+    APPLE_ID_EMAIL=""
+    if [ -r /dev/tty ]; then
+        printf "Apple ID email: "
+        read -r APPLE_ID_EMAIL < /dev/tty
     else
-        ./bin/plumesign account login
+        die "No controlling terminal available for Apple ID prompt"
+    fi
+    if [ -z "$APPLE_ID_EMAIL" ]; then
+        die "Apple ID email is required for plumesign login"
+    fi
+
+    if [ ! -t 0 ] && [ -r /dev/tty ]; then
+        ./bin/plumesign account login -u "$APPLE_ID_EMAIL" < /dev/tty
+    else
+        ./bin/plumesign account login -u "$APPLE_ID_EMAIL"
     fi
 else
     email=$("$VENV_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("selected_account","(unknown)"))' < "$HOME/.config/PlumeImpactor/accounts.json" 2>/dev/null || echo "(unknown)")
