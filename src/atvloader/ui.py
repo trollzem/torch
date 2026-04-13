@@ -155,6 +155,28 @@ def _format_expiry(iso: str | None) -> str:
     return f"{remaining_hours}h {minutes}m left"
 
 
+def _format_cert_expiry(iso: str | None) -> str:
+    """Days until the developer certificate expires.
+
+    Cert is valid for 364 days on free accounts — no need for the hour-
+    level precision that profile expiry uses. Returns strings like:
+      - "unknown"         (cert status not yet polled)
+      - "304 days left"   (normal)
+      - "3 days left"     (inside warning window)
+      - "expired"
+    """
+    if not iso:
+        return "unknown"
+    try:
+        exp = datetime.fromisoformat(iso)
+    except ValueError:
+        return "unknown"
+    delta = exp - datetime.now(timezone.utc)
+    if delta.total_seconds() <= 0:
+        return "expired"
+    return f"{delta.days} days left"
+
+
 class ATVLoaderApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(
@@ -256,11 +278,38 @@ class ATVLoaderApp(rumps.App):
         )
         return f"{ok_count}/{total} apps fresh · {_format_age(freshest)}"
 
+    def _cert_summary(self) -> str | None:
+        """Return the cert-expiration status line, or None to hide it.
+
+        Shows a countdown when the cert is healthy so the user has a
+        calm always-visible signal that everything's ok. Adds an
+        icon prefix when the cert is expiring / expired / revoked /
+        missing so the problem is immediately obvious.
+        """
+        cs = self.cfg.cert_status
+        if cs.status == "unknown" and not cs.expiration_date:
+            return None
+        label = _format_cert_expiry(cs.expiration_date)
+        if cs.status == "ok":
+            return f"Cert: {label}"
+        if cs.status == "expiring":
+            return f"⚠️ Cert expiring: {label}"
+        if cs.status == "expired":
+            return "❌ Cert expired — re-login required"
+        if cs.status == "revoked":
+            return "❌ Cert revoked — re-login required"
+        if cs.status == "missing":
+            return "❌ No developer cert — re-login required"
+        return f"Cert: {label}"
+
     def _build_menu(self) -> None:
         self.menu.clear()
 
-        # Header: current status
+        # Header: current status + cert expiration line
         self.menu.add(rumps.MenuItem(self._status_summary(), callback=None))
+        cert_line = self._cert_summary()
+        if cert_line:
+            self.menu.add(rumps.MenuItem(cert_line, callback=None))
         self.menu.add(rumps.separator)
 
         # Apps submenu — each IPA is a parent item with a sub-menu
@@ -449,8 +498,17 @@ class ATVLoaderApp(rumps.App):
         """
         if respect_refreshing and self._icon_state == ICON_REFRESHING:
             return
+        # Cert problems are the most severe — they imply every refresh
+        # will silently produce broken IPAs. Hoist them above per-IPA
+        # errors in the icon priority.
+        if self.cfg.cert_status.status in ("expired", "revoked", "missing"):
+            self._set_icon(ICON_ERROR)
+            return
         if any(i.status not in ("ok", "pending") for i in self.cfg.ipas):
             self._set_icon(ICON_ERROR)
+            return
+        if self.cfg.cert_status.status == "expiring":
+            self._set_icon(ICON_STALE)
             return
         if any(
             refresh.needs_refresh(i, self.cfg.settings.refresh_interval_days)

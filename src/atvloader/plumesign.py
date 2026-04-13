@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -82,6 +83,17 @@ class AppIdInfo:
     app_id_id: str
     identifier: str         # "com.google.ios.youtube.3G6AP3U89B"
     name: str
+
+
+@dataclass
+class CertInfo:
+    """A development certificate as reported by Apple's portal."""
+    certificate_id: str           # e.g. "G24N6XD9U6"
+    name: str                     # e.g. "iOS Development: eissahazem@gmail.com"
+    serial_number: str            # hex
+    status: str                   # "Issued" | "Revoked" | ...
+    expiration_date: datetime     # UTC
+    machine_name: str | None      # e.g. "AltStore"
 
 
 # --- Core subprocess helpers -------------------------------------------------
@@ -302,6 +314,77 @@ def list_app_ids() -> list[AppIdInfo]:
         )
     log.debug("parsed %d app IDs from plumesign output", len(records))
     return records
+
+
+def list_certs() -> list[CertInfo]:
+    """Return development certificates on Apple's developer portal.
+
+    Parses plumesign's `account certificates` Rust-Debug output. Records
+    with unparseable expiration dates or missing required fields are
+    skipped (logged at debug).
+    """
+    result = _run_plumesign(["account", "certificates"], check=False)
+    if result.returncode != 0:
+        _classify_failure_and_raise(result.stderr)
+    text = result.stdout + result.stderr
+
+    # Example debug-printed record fragment:
+    #   name: "iOS Development: Hazem Eissa",
+    #   certificate_id: "G24N6XD9U6",
+    #   serial_number: "3E8019E8...",
+    #   status: "Issued",
+    #   expiration_date: 2027-04-12T23:21:56Z,
+    #   ...
+    #   machine_name: Some(
+    #       "AltStore",
+    #   ),
+    block_re = re.compile(
+        r'name:\s*"(?P<name>[^"]+)"\s*,'
+        r'[^}]*?certificate_id:\s*"(?P<cid>[^"]+)"\s*,'
+        r'[^}]*?serial_number:\s*"(?P<serial>[^"]+)"\s*,'
+        r'[^}]*?status:\s*"(?P<status>[^"]+)"\s*,'
+        r'[^}]*?expiration_date:\s*(?P<exp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)'
+        r'[^}]*?(?:machine_name:\s*(?:None|Some\(\s*"(?P<machine>[^"]+)"))?',
+        re.DOTALL,
+    )
+    out: list[CertInfo] = []
+    for m in block_re.finditer(text):
+        try:
+            exp = datetime.strptime(m.group("exp"), "%Y-%m-%dT%H:%M:%SZ")
+            # Apple returns naive UTC; mark it as such.
+            from datetime import timezone as _tz
+            exp = exp.replace(tzinfo=_tz.utc)
+        except ValueError as e:
+            log.debug("failed to parse cert expiration %r: %s", m.group("exp"), e)
+            continue
+        out.append(
+            CertInfo(
+                certificate_id=m.group("cid"),
+                name=m.group("name"),
+                serial_number=m.group("serial"),
+                status=m.group("status"),
+                expiration_date=exp,
+                machine_name=m.group("machine"),
+            )
+        )
+    log.debug("parsed %d certs from plumesign output", len(out))
+    return out
+
+
+def current_cert() -> CertInfo | None:
+    """Return the cert plumesign is likely to use for signing.
+
+    Heuristic: the most-distant expiration among issued (non-revoked)
+    certificates. This matches plumesign's own internal selection, which
+    prefers the newest valid cert. Returns None if there are no issued
+    certificates on the account (which means the next sign will either
+    create one or fail noisily).
+    """
+    certs = list_certs()
+    issued = [c for c in certs if c.status.lower() == "issued"]
+    if not issued:
+        return None
+    return max(issued, key=lambda c: c.expiration_date)
 
 
 # --- Signing pipeline --------------------------------------------------------

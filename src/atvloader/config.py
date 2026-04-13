@@ -68,12 +68,29 @@ class Settings:
 
 
 @dataclass
+class CertStatus:
+    """Cached snapshot of the dev cert plumesign is using.
+
+    This is a *display* value — the authoritative cert state lives in
+    Apple's developer portal and is queried by refresh.py at the top of
+    every refresh cycle. We persist the last-known result so the menubar
+    can show a countdown without hitting the portal on every menu redraw.
+    """
+    certificate_id: str | None = None
+    name: str | None = None
+    expiration_date: str | None = None  # ISO8601 UTC string
+    status: str = "unknown"              # ok | expiring | expired | revoked | missing | unknown
+    checked_at: str | None = None        # when we last refreshed this snapshot
+
+
+@dataclass
 class Config:
     version: int = CONFIG_VERSION
     apple_id_email: str | None = None
     devices: list[Device] = field(default_factory=list)
     ipas: list[IPA] = field(default_factory=list)
     settings: Settings = field(default_factory=Settings)
+    cert_status: CertStatus = field(default_factory=CertStatus)
 
     @classmethod
     def load(cls) -> Config:
@@ -93,12 +110,14 @@ class Config:
         devices = [Device(**d) for d in data.get("devices", [])]
         ipas = [IPA(**i) for i in data.get("ipas", [])]
         settings = Settings(**data.get("settings", {}))
+        cert_status = CertStatus(**data.get("cert_status", {}))
         return cls(
             version=data.get("version", CONFIG_VERSION),
             apple_id_email=data.get("apple_id_email"),
             devices=devices,
             ipas=ipas,
             settings=settings,
+            cert_status=cert_status,
         )
 
     def device_by_pair_record(self, pair_record_id: str) -> Device | None:
@@ -167,6 +186,55 @@ def plumesign_team_id() -> str | None:
         if isinstance(account, dict):
             return account.get("team_id")
     return None
+
+
+def _preferred_backup_dir() -> Path:
+    """Return the directory where we mirror pair records + config.
+
+    Prefers iCloud Drive if it exists (so a Mac restore puts everything
+    back); otherwise falls back to ~/Documents/ATVLoader-Backup/. Pair
+    records are the single hardest-to-recover piece of ATVLoader state
+    (the Apple TV won't issue a new PIN without physically cycling its
+    pairing screen), so protecting them across Mac loss is worth the
+    5 minutes of work.
+    """
+    icloud = (
+        Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    )
+    if icloud.exists() and icloud.is_dir():
+        return icloud / "ATVLoader" / "backup"
+    return Path.home() / "Documents" / "ATVLoader-Backup"
+
+
+def backup_pair_records() -> int:
+    """Copy ~/.pymobiledevice3/remote_*.plist to the backup directory.
+
+    Returns the number of pair records copied. Idempotent: existing
+    backups get overwritten only if the source mtime is newer. Swallows
+    per-file errors so a single bad pair record doesn't abort the run.
+    """
+    if not paths.PYMD3_PAIR_RECORDS_DIR.exists():
+        return 0
+    dest_dir = _preferred_backup_dir() / "pair-records"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("could not create pair-record backup dir %s: %s", dest_dir, e)
+        return 0
+
+    copied = 0
+    for src in paths.PYMD3_PAIR_RECORDS_DIR.glob("remote_*.plist"):
+        dest = dest_dir / src.name
+        try:
+            if dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime:
+                continue
+            shutil.copy2(src, dest)
+            copied += 1
+        except OSError as e:
+            log.warning("failed to back up %s: %s", src.name, e)
+    if copied:
+        log.info("backed up %d pair record(s) to %s", copied, dest_dir)
+    return copied
 
 
 def seed_devices_from_pair_records() -> list[Device]:
@@ -367,6 +435,14 @@ def bootstrap() -> Config:
     # Sync IPAs from the runtime folder every run.
     if sync_ipas_folder(cfg):
         log.info("IPAs folder changed; config updated")
+
+    # Mirror pair records to iCloud Drive (or ~/Documents) so a Mac
+    # loss / reinstall doesn't force you to re-pair every device from
+    # scratch. Best-effort; errors are logged but don't block startup.
+    try:
+        backup_pair_records()
+    except Exception as e:  # noqa: BLE001
+        log.warning("pair record backup failed: %s", e)
 
     cfg.save()
     return cfg

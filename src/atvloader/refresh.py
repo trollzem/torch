@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import paths, plumesign, pymd3
-from .config import Config, Device, IPA
+from .config import CertStatus, Config, Device, IPA
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,11 @@ MAX_CONSECUTIVE_FAILURES = 3
 # apps get "untrusted" on the device and stop launching). We refuse to
 # install the 4th rather than trip this invisible edge.
 FREE_TIER_DEVICE_APP_CAP = 3
+
+# Warn the user when the dev cert is within this many days of expiring.
+# Certs are valid for 364 days on free accounts; we start alerting at
+# 14 days left so there's a comfortable window to re-login and rotate.
+CERT_EXPIRY_WARNING_DAYS = 14
 
 
 class RefreshAborted(Exception):
@@ -113,6 +118,65 @@ def is_frozen(ipa: IPA) -> bool:
     """True if the IPA has hit the retry cap and should be skipped until
     the user intervenes."""
     return ipa.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+
+
+def refresh_cert_status(cfg: Config) -> CertStatus:
+    """Query Apple's developer portal for the current cert and update
+    cfg.cert_status in place.
+
+    Runs once per refresh cycle (cheap — one HTTP call). Produces one of:
+      - "ok"       : cert exists and expires more than CERT_EXPIRY_WARNING_DAYS away
+      - "expiring" : cert exists but expires within the warning window
+      - "expired"  : cert exists but expiration_date is in the past
+      - "revoked"  : cert exists but status != "Issued"
+      - "missing"  : Apple's portal has no issued cert for this team
+      - "unknown"  : query failed (network, auth, parsing) — leaves the
+                     previous snapshot in place so the menubar keeps
+                     showing stale-but-useful data
+
+    Never raises. The caller decides what to do with the status (the
+    refresh orchestrator soft-fails on "expired" and "missing" since
+    the next sign would produce a broken IPA).
+    """
+    try:
+        cert = plumesign.current_cert()
+    except plumesign.PlumesignError as e:
+        log.warning("cert status query failed: %s", e)
+        return cfg.cert_status  # preserve last-known
+    except Exception as e:  # noqa: BLE001
+        log.exception("unexpected error in cert status query: %s", e)
+        return cfg.cert_status
+
+    now = _now()
+    checked_at = _now_iso()
+
+    if cert is None:
+        cfg.cert_status = CertStatus(
+            certificate_id=None,
+            name=None,
+            expiration_date=None,
+            status="missing",
+            checked_at=checked_at,
+        )
+        return cfg.cert_status
+
+    if cert.status.lower() != "issued":
+        state = "revoked"
+    elif cert.expiration_date <= now:
+        state = "expired"
+    elif (cert.expiration_date - now).days < CERT_EXPIRY_WARNING_DAYS:
+        state = "expiring"
+    else:
+        state = "ok"
+
+    cfg.cert_status = CertStatus(
+        certificate_id=cert.certificate_id,
+        name=cert.name,
+        expiration_date=cert.expiration_date.isoformat(),
+        status=state,
+        checked_at=checked_at,
+    )
+    return cfg.cert_status
 
 
 def count_active_apps_on_device(cfg: Config, device: Device) -> int:
@@ -450,6 +514,24 @@ def _refresh_all_locked(
     if not pymd3.is_tunneld_up():
         emit("tunneld is down; cannot refresh")
         raise RefreshAborted("tunneld down")
+
+    # Check the dev cert on Apple's portal. If it's expired or revoked,
+    # stop the whole run — the next sign would produce an IPA that
+    # installs cleanly but gets rejected by the device at launch time.
+    emit("checking developer certificate status")
+    status = refresh_cert_status(cfg)
+    if status.status in ("expired", "revoked", "missing"):
+        msg = (
+            f"developer certificate is {status.status}; refresh aborted. "
+            f"Re-run `plumesign account login` to rotate."
+        )
+        emit(msg)
+        cfg.save()
+        raise RefreshAborted(msg)
+    if status.status == "expiring":
+        emit(
+            f"⚠️ dev cert expires {status.expiration_date} (status=expiring)"
+        )
 
     # Reconcile devices so we know platform/UDID of every target.
     emit("reconciling devices against tunneld")
