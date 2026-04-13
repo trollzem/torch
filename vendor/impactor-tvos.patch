@@ -1,0 +1,43 @@
+diff --git a/crates/plume_core/src/developer/mod.rs b/crates/plume_core/src/developer/mod.rs
+index b68d1d9..e643f41 100644
+--- a/crates/plume_core/src/developer/mod.rs
++++ b/crates/plume_core/src/developer/mod.rs
+@@ -4,10 +4,20 @@ pub mod v1;
+ 
+ pub use session::{DeveloperSession, RequestType};
+ 
++#[doc(hidden)]
++pub fn _build_endpoint(path: impl AsRef<str>) -> String {
++    // URL rewriting kept as a no-op hook for future experimentation; the
++    // /tvos/ endpoints for free-tier accounts appear to be unpopulated, so
++    // for now all requests stay at the documented /ios/ paths. tvOS
++    // behavior is toggled via a body parameter in qh_get_profile instead.
++    let path = path.as_ref();
++    format!("https://developerservices2.apple.com/services{path}")
++}
++
+ #[macro_export]
+ macro_rules! developer_endpoint {
+     ($endpoint:expr) => {
+-        format!("https://developerservices2.apple.com/services{}", $endpoint)
++        $crate::developer::_build_endpoint($endpoint)
+     };
+ }
+ 
+diff --git a/crates/plume_core/src/developer/qh/profile.rs b/crates/plume_core/src/developer/qh/profile.rs
+index 92cf54c..675ece3 100644
+--- a/crates/plume_core/src/developer/qh/profile.rs
++++ b/crates/plume_core/src/developer/qh/profile.rs
+@@ -17,6 +17,12 @@ impl DeveloperSession {
+         let mut body = Dictionary::new();
+         body.insert("teamId".to_string(), Value::String(team_id.clone()));
+         body.insert("appIdId".to_string(), Value::String(app_id_id.clone()));
++        if std::env::var("PLUME_FORCE_TVOS").is_ok() {
++            body.insert(
++                "subPlatform".to_string(),
++                Value::String("tvOS".to_string()),
++            );
++        }
+ 
+         let response = self.qh_send_request(&endpoint, Some(body)).await?;
+         let response_data: ProfilesResponse = plist::from_value(&Value::Dictionary(response))?;
