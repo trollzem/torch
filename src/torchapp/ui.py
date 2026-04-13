@@ -985,7 +985,11 @@ class TorchApp(rumps.App):
                 ipa.target_devices.append(pair_id)
 
         self.cfg.save()
-        self._rebuild()
+        # Note: do NOT call self._rebuild() here. This method runs on a
+        # worker thread (spawned by _post_pair_reconcile_worker), and
+        # _rebuild() mutates self.menu — an NSMenu — which Cocoa will
+        # trap on non-main-thread access. The caller calls
+        # _rebuild_async() (main-thread-marshaled) after we return.
 
     def on_open_ipas_folder(self, _sender: object) -> None:
         subprocess.run(["open", str(paths.IPAS_DIR)])
