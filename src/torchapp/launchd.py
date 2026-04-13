@@ -31,6 +31,35 @@ from pathlib import Path
 
 from . import paths
 
+
+def _current_python() -> Path:
+    """Python interpreter to bake into the LaunchAgent plist.
+
+    Prefers `sys.executable` (whatever is running install.py). When
+    bootstrap.sh invokes `./.venv/bin/python3 src/install.py`, this
+    resolves to the venv python, which has all the Torch dependencies
+    installed. Falls back to `which python3` for direct invocations
+    (e.g. running `python3 src/install.py` by hand).
+    """
+    exe = Path(sys.executable)
+    if exe.exists():
+        return exe
+    return Path(_resolve_binary("python3"))
+
+
+def _pymobiledevice3_bin() -> Path:
+    """Path to the pymobiledevice3 CLI.
+
+    Prefers the copy next to our current Python interpreter (i.e.
+    inside the same venv), since that's the one guaranteed to have
+    the matching package installed. Falls back to `which` if we
+    can't find a sibling.
+    """
+    candidate = _current_python().parent / "pymobiledevice3"
+    if candidate.exists():
+        return candidate
+    return Path(_resolve_binary("pymobiledevice3"))
+
 log = logging.getLogger(__name__)
 
 TUNNELD_LABEL = "com.torch.tunneld"
@@ -83,7 +112,7 @@ def tunneld_plist() -> dict:
        we only need PATH for any child subprocesses tunneld might
        spawn.
     """
-    pymd3_bin = _resolve_binary("pymobiledevice3")
+    pymd3_bin = str(_pymobiledevice3_bin())
     user_home = str(Path.home())
     return {
         "Label": TUNNELD_LABEL,
@@ -107,7 +136,7 @@ def tunneld_plist() -> dict:
 
 def app_plist() -> dict:
     """Return the plist dict for the menubar LaunchAgent."""
-    python_bin = _resolve_binary("python3")
+    python_bin = str(_current_python())
     project_src = str(paths.PROJECT_ROOT / "src")
     logs_dir = paths.LOG_DIR
     logs_dir.mkdir(parents=True, exist_ok=True)

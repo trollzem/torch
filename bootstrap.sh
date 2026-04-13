@@ -105,17 +105,33 @@ cd "$TARGET_DIR"
 #  Step 5: Python dependencies
 # ---------------------------------------------------------------------------
 
-log "Installing Python packages (rumps, keyring, pexpect, pyobjc, pymobiledevice3)"
-# NOTE: we deliberately do NOT `pip install --upgrade pip` here, because
-# Homebrew-installed pip has no RECORD file and pip can't uninstall it
-# to perform an upgrade ("Cannot uninstall pip X.Y: no RECORD file").
-# Homebrew already ships a current-enough pip for our needs.
-python3 -m pip install --break-system-packages --quiet -r requirements.txt
-python3 -m pip install --break-system-packages --quiet pymobiledevice3
+# Create a dedicated virtualenv inside the repo rather than installing
+# into Homebrew-managed system site-packages. Two reasons:
+#   1. Homebrew-installed pip has no RECORD file, so pip cannot
+#      uninstall-to-upgrade itself when building packages in isolated
+#      build environments. On Homebrew python@3.14 shipping pip 26+,
+#      even `pip install -r requirements.txt` silently triggers this
+#      and fails with "Cannot uninstall pip X.Y".
+#   2. Isolating Torch's dependencies from system Python means we
+#      never collide with anything else you've installed and we can
+#      pin versions without polluting the rest of your machine.
+VENV_DIR="$TARGET_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python3"
+VENV_PIP="$VENV_DIR/bin/pip"
 
-# Sanity check the imports before going further — a broken Python install
-# will break everything downstream in confusing ways.
-python3 - <<'PY' || die "Python dependency import failed. Check the error above."
+if [ ! -x "$VENV_PYTHON" ]; then
+    log "Creating Python virtualenv at $VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+fi
+
+log "Installing Python packages into the virtualenv"
+"$VENV_PIP" install --quiet --upgrade pip setuptools wheel
+"$VENV_PIP" install --quiet -r requirements.txt
+"$VENV_PIP" install --quiet pymobiledevice3
+
+# Sanity check the imports via the venv's Python — a broken install
+# would break everything downstream in confusing ways.
+"$VENV_PYTHON" - <<'PY' || die "Python dependency import failed. Check the error above."
 import rumps, keyring, pexpect, pymobiledevice3
 from PyObjCTools import AppHelper
 print(f"  rumps {rumps.__version__}")
@@ -153,7 +169,7 @@ if [ ! -f "$HOME/.config/PlumeImpactor/accounts.json" ]; then
     echo
     ./bin/plumesign account login
 else
-    email=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("selected_account","(unknown)"))' < "$HOME/.config/PlumeImpactor/accounts.json" 2>/dev/null || echo "(unknown)")
+    email=$("$VENV_PYTHON" -c 'import json,sys; print(json.load(sys.stdin).get("selected_account","(unknown)"))' < "$HOME/.config/PlumeImpactor/accounts.json" 2>/dev/null || echo "(unknown)")
     log "plumesign session already exists for $email"
 fi
 
@@ -165,7 +181,11 @@ log "Installing launchd services (tunneld LaunchDaemon + menubar LaunchAgent)"
 log "macOS will prompt you for your admin password in a native dialog — this"
 log "is the only admin-password moment. After this, nothing else needs sudo."
 echo
-python3 src/install.py
+# Use the venv's Python so that launchd.py resolves sys.executable to
+# the venv interpreter and bakes that path into the launchd plists
+# (instead of pointing them at system Python, which would then crash
+# at import time with ModuleNotFoundError: rumps).
+"$VENV_PYTHON" src/install.py
 
 # ---------------------------------------------------------------------------
 #  Step 9: Pairing guidance
