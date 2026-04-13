@@ -61,11 +61,40 @@ def _resolve_binary(name: str) -> str:
 
 
 def tunneld_plist() -> dict:
-    """Return the plist dict for the tunneld LaunchDaemon."""
+    """Return the plist dict for the tunneld LaunchDaemon.
+
+    A LaunchDaemon runs as root with an almost-empty environment. Two
+    concerns to address:
+
+    1. pymobiledevice3 reads pair records from ~/.pymobiledevice3/ which
+       expands via HOME. Without setting HOME explicitly here, root's
+       HOME defaults to /var/root and tunneld can't see the user's
+       Apple TV pair records — it only picks up USB devices via
+       usbmuxd (which is mediated by the kernel, independent of HOME).
+       We bake the installing user's $HOME into the plist so root's
+       tunneld reads from the same directory the manual-sudo version
+       did during the spike.
+
+    2. pymobiledevice3's pip-installed dependencies live in
+       /opt/homebrew/lib/python3.14/site-packages. root's default
+       PATH doesn't include /opt/homebrew/bin, which would also
+       break subprocess resolution of the pymobiledevice3 CLI
+       itself — but we're invoking it via absolute path already, so
+       we only need PATH for any child subprocesses tunneld might
+       spawn.
+    """
     pymd3_bin = _resolve_binary("pymobiledevice3")
+    user_home = str(Path.home())
     return {
         "Label": TUNNELD_LABEL,
         "ProgramArguments": [pymd3_bin, "remote", "tunneld", "--wifi"],
+        "EnvironmentVariables": {
+            "HOME": user_home,
+            "PATH": os.environ.get(
+                "PATH",
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            ),
+        },
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(TUNNELD_LOG_OUT),
