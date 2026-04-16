@@ -35,6 +35,7 @@ The big technical wins:
 - 🚫 Pre-kill running apps before install so installd never hangs
 - 📊 Expiration countdown for each app and for the developer certificate
 - 🪪 Free Apple ID "3 apps per device" cap tracking — no silent invalidation
+- 🎯 Per-IPA device targeting — pick which of your paired Apple TVs / iPhones / iPads each IPA installs to, right from the menu
 - 💾 Pair records auto-backed up to iCloud Drive so a Mac restore never loses paired devices
 - 🧹 One-command install and uninstall
 
@@ -107,10 +108,18 @@ iPhones and iPads don't have a manual pairing screen — the first time you plug
 
 ### Adding an IPA
 
-1. Click the 🔥 flame icon → **Apps** → **Add IPA…** (which opens the runtime IPAs folder in Finder)
-2. Drop `.ipa` files into that folder.
-3. Torch picks them up within 5 seconds (config watcher), detects the platform (tvOS / iOS / iPadOS), and auto-targets the new IPA at every compatible device.
+1. Click the 🔥 flame icon → **Apps** → **Add IPA…**
+2. Pick one or more `.ipa` files from the file picker.
+3. Torch copies them into its runtime folder, detects the platform (tvOS / iOS / iPadOS), and auto-targets the new IPAs at every compatible paired device.
 4. Click **Refresh Now** to sign and install immediately, or wait for the next 6-day auto-refresh cycle.
+
+If you'd rather drop `.ipa` files in manually, the **Open IPAs Folder** menu item still reveals the folder in Finder — anything dropped in is picked up by the config watcher within 5 seconds.
+
+### Choosing which devices an IPA installs to
+
+Each tracked IPA has an **Install on devices** submenu showing every paired device whose platform is compatible. Click a device to toggle it on or off; the checkmark reflects the current state. The selected targets are shown on the **Targets:** line of the same submenu.
+
+One signed IPA can install to as many devices as you like — Torch registers every target UDID into the same provisioning profile, so you never need to duplicate the IPA file per device.
 
 ### Status at a glance
 

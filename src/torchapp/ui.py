@@ -158,6 +158,56 @@ def _format_age(iso: str | None) -> str:
     return f"{days}d ago"
 
 
+def _pick_ipa_files() -> list[Path]:
+    """Show an NSOpenPanel restricted to .ipa files.
+
+    Returns the list of selected file paths, or an empty list on cancel.
+    Must be called on the Cocoa main thread (rumps menu callbacks are).
+
+    LSUIElement apps (no dock icon) open panels behind whatever's
+    foregrounded, so we call activateIgnoringOtherApps_ first to pull
+    the panel to the front. Without that the click feels like a no-op.
+    """
+    try:
+        from AppKit import NSApp, NSOpenPanel  # type: ignore[import-not-found]
+    except ImportError:
+        log.warning("AppKit unavailable; cannot show file picker")
+        return []
+
+    # NSModalResponseOK is 1 but isn't exposed by every PyObjC build.
+    NS_MODAL_RESPONSE_OK = 1
+
+    panel = NSOpenPanel.openPanel()
+    panel.setAllowsMultipleSelection_(True)
+    panel.setCanChooseFiles_(True)
+    panel.setCanChooseDirectories_(False)
+    panel.setMessage_("Choose one or more .ipa files to add to Torch.")
+    panel.setPrompt_("Add")
+
+    type_set = False
+    try:
+        from UniformTypeIdentifiers import UTType  # type: ignore[import-not-found]
+        ipa_type = UTType.typeWithFilenameExtension_("ipa")
+        if ipa_type is not None:
+            panel.setAllowedContentTypes_([ipa_type])
+            type_set = True
+    except Exception:  # noqa: BLE001
+        pass
+    if not type_set:
+        try:
+            panel.setAllowedFileTypes_(["ipa"])
+        except Exception:  # noqa: BLE001
+            pass
+
+    app = NSApp()
+    if app is not None:
+        app.activateIgnoringOtherApps_(True)
+
+    if panel.runModal() != NS_MODAL_RESPONSE_OK:
+        return []
+    return [Path(str(url.path())) for url in panel.URLs()]
+
+
 def _format_expiry(iso: str | None) -> str:
     """Human-friendly time until profile expiry.
 
@@ -413,7 +463,74 @@ class TorchApp(rumps.App):
                 ipa_parent.add(
                     rumps.MenuItem("Remove from tracking", callback=_remove_cb)
                 )
+
+                # Targets submenu — per-IPA device selection. Only lists
+                # devices whose class is compatible with the IPA's
+                # platform (tvOS IPAs only show Apple TVs, iOS/iPadOS
+                # IPAs only show iPhones/iPads). Clicking toggles
+                # membership in ipa.target_devices; refresh.py does the
+                # rest at the next refresh.
+                targets_item = rumps.MenuItem("Install on devices")
+                compatible = [
+                    d for d in self.cfg.devices
+                    if d.device_class != "unknown"
+                    and refresh.is_compatible(ipa.platform, d.device_class)
+                ]
+                if compatible:
+                    for device in compatible:
+                        is_target = (
+                            device.pair_record_identifier in ipa.target_devices
+                        )
+                        d_label = device.name
+                        if device.product_type:
+                            d_label += f" · {device.product_type}"
+
+                        # Default args bind loop vars at each iteration,
+                        # same pattern as _refresh_cb / _remove_cb above.
+                        def _toggle_cb(
+                            _sender,
+                            fn=ipa.filename,
+                            pid=device.pair_record_identifier,
+                        ):  # type: ignore[no-untyped-def]
+                            self._toggle_target(fn, pid)
+
+                        d_item = rumps.MenuItem(d_label, callback=_toggle_cb)
+                        d_item.state = 1 if is_target else 0
+                        targets_item.add(d_item)
+                else:
+                    targets_item.add(
+                        rumps.MenuItem(
+                            f"No compatible {ipa.platform} devices paired",
+                            callback=None,
+                        )
+                    )
+                ipa_parent.add(targets_item)
+
                 ipa_parent.add(rumps.separator)
+                # Compact one-line summary of which devices this IPA is
+                # currently targeted at (names only; details live in the
+                # Devices menu).
+                target_names = [
+                    d.name
+                    for d in self.cfg.devices
+                    if d.pair_record_identifier in ipa.target_devices
+                    and d.device_class != "unknown"
+                    and refresh.is_compatible(ipa.platform, d.device_class)
+                ]
+                if target_names:
+                    ipa_parent.add(
+                        rumps.MenuItem(
+                            f"Targets: {', '.join(target_names)}",
+                            callback=None,
+                        )
+                    )
+                else:
+                    ipa_parent.add(
+                        rumps.MenuItem(
+                            "Targets: (none — pick under 'Install on devices')",
+                            callback=None,
+                        )
+                    )
                 ipa_parent.add(
                     rumps.MenuItem(
                         f"Bundle: {ipa.original_bundle_id}", callback=None
@@ -601,6 +718,41 @@ class TorchApp(rumps.App):
         # Callback is already on main thread — schedule worker immediately.
         self._background_check(force=True)
 
+    def _toggle_target(
+        self, ipa_filename: str, pair_record_identifier: str
+    ) -> None:
+        """Toggle whether this IPA installs to the given device.
+
+        Main-thread callback (clicked from the per-IPA "Install on
+        devices" submenu). Mutates ipa.target_devices, saves config,
+        and rebuilds the menu so the checkmark state updates. No
+        refresh is triggered — the next scheduled refresh (or an
+        explicit "Refresh now") will act on the new target set.
+        """
+        ipa = next(
+            (i for i in self.cfg.ipas if i.filename == ipa_filename), None
+        )
+        if ipa is None:
+            log.warning("toggle target: IPA %s not found", ipa_filename)
+            return
+        if pair_record_identifier in ipa.target_devices:
+            ipa.target_devices.remove(pair_record_identifier)
+            log.info(
+                "untargeted device %s from IPA %s",
+                pair_record_identifier,
+                ipa_filename,
+            )
+        else:
+            ipa.target_devices.append(pair_record_identifier)
+            log.info(
+                "targeted device %s for IPA %s",
+                pair_record_identifier,
+                ipa_filename,
+            )
+        self.cfg.save()
+        self._last_config_mtime = self._config_mtime()
+        self._rebuild()
+
     def _refresh_one(self, filename: str) -> None:
         """Trigger a force-refresh of a single IPA by filename. Called from
         a main-thread menu callback; dispatches the actual work onto a
@@ -674,16 +826,45 @@ class TorchApp(rumps.App):
         self._background_check(force=False)
 
     def on_add_ipa(self, _sender: object) -> None:
-        # We can't open an NSOpenPanel easily from rumps without PyObjC
-        # incantations. For v1 we reveal the IPAs folder in Finder and
-        # trust the user to drop files in. The polling watcher (hourly
-        # tick, or the IPAs-folder sync at next app start) picks them up.
-        subprocess.run(["open", str(paths.IPAS_DIR)])
+        """Show a file picker, copy chosen .ipa files into the runtime
+        folder, sync config, and rebuild the menu. Main-thread callback
+        — NSOpenPanel must run on the main thread."""
+        paths.IPAS_DIR.mkdir(parents=True, exist_ok=True)
+        selected = _pick_ipa_files()
+        if not selected:
+            return
+
+        added: list[str] = []
+        skipped: list[str] = []
+        for src in selected:
+            dest = paths.IPAS_DIR / src.name
+            if dest.exists():
+                skipped.append(src.name)
+                continue
+            try:
+                shutil.copy2(src, dest)
+                added.append(src.name)
+            except OSError as e:
+                log.warning("failed to copy %s into IPAs folder: %s", src, e)
+
+        if not added:
+            if skipped:
+                rumps.notification(
+                    "Torch",
+                    "Already in IPAs folder",
+                    f"Skipped (already tracked): {', '.join(skipped)}",
+                )
+            return
+
+        if cfgmod.sync_ipas_folder(self.cfg):
+            self.cfg.save()
+        self._last_config_mtime = self._config_mtime()
+        self._rebuild()
         rumps.notification(
             "Torch",
-            "Add an IPA",
-            "Drop .ipa files into the folder that just opened, then click "
-            "'Refresh Now' to pick them up.",
+            "IPAs added",
+            f"Added {len(added)} IPA{'s' if len(added) != 1 else ''}: "
+            f"{', '.join(added)}",
         )
 
     # --- Apple ID login ------------------------------------------------------
