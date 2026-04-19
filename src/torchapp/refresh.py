@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
-from . import paths, plumesign, pymd3
+from . import installer, paths, plumesign, pymd3
 from .config import CertStatus, Config, Device, IPA
 
 log = logging.getLogger(__name__)
@@ -84,13 +84,12 @@ def _parse_iso(value: str | None) -> datetime | None:
 def is_compatible(ipa_platform: str, device_class: str) -> bool:
     """Can this IPA run on this device class?
 
-    tvOS is strict: only tvOS devices. iOS and iPadOS are treated as
-    interchangeable because the provisioning profile shape is the same
-    (both use the default /ios/ endpoint with no subPlatform).
+    Single source of truth lives in config.platform_matches_device so
+    config-time auto-targeting and refresh-time install filtering stay
+    in lockstep.
     """
-    if ipa_platform == "tvOS":
-        return device_class == "tvOS"
-    return device_class in ("iOS", "iPadOS")
+    from .config import platform_matches_device
+    return platform_matches_device(ipa_platform, device_class)
 
 
 def force_tvos_flag(ipa_platform: str) -> bool:
@@ -218,8 +217,26 @@ def reconcile_devices(cfg: Config) -> Config:
 
     Failures (device offline, tunneld down for one device) are logged and
     leave that device's record unchanged.
+
+    Mutates cfg.devices in place (not via list reassignment) so that any
+    devices appended concurrently by the iOS auto-detect worker survive
+    this reconcile cycle. Reassigning `cfg.devices = [...]` would race
+    with a concurrent append and silently drop the newly-added entry.
     """
-    cfg.devices = pymd3.reconcile_all(cfg.devices)
+    for i in range(len(cfg.devices)):
+        current = cfg.devices[i]
+        try:
+            cfg.devices[i] = pymd3.reconcile_device(current)
+        except (
+            pymd3.TunnelNotFoundError,
+            pymd3.LockdownError,
+            pymd3.TunneldDownError,
+        ) as e:
+            log.warning(
+                "could not reconcile device %s: %s",
+                current.pair_record_identifier,
+                e,
+            )
     cfg.save()
     return cfg
 
@@ -300,8 +317,27 @@ def _record_success(ipa: IPA) -> None:
 
 
 def _record_failure(ipa: IPA, status: str, error: str) -> None:
+    """Hard failure: bump consecutive_failures toward the freeze cap.
+
+    Use for genuine signing or install errors the user can't work
+    around by waiting (plumesign auth, signed-IPA rejected, etc.)."""
     ipa.status = status
     ipa.consecutive_failures += 1
+    ipa.last_error = error[:500]
+
+
+def _record_soft_failure(ipa: IPA, status: str, error: str) -> None:
+    """Soft failure: record status + message but DON'T bump strikes.
+
+    Use for transient / user-fixable states where hourly retries should
+    continue indefinitely:
+      - device-offline (iPhone dozing, Apple TV unplugged)
+      - device-at-cap (user must uninstall apps)
+      - partial (some targets installed, others offline)
+    None of these should eventually freeze the IPA the way three
+    genuine install failures would.
+    """
+    ipa.status = status
     ipa.last_error = error[:500]
 
 
@@ -395,41 +431,92 @@ def refresh_one(
         emit(f"sign failed: {e}")
         return False
 
-    # 3. Install to every compatible target.
-    all_installs_ok = True
+    # 3. Install to every compatible target. Route per-device through
+    #    installer.install_for_device which picks the correct path
+    #    (pymd3 RSD for tvOS, classic libimobiledevice for iOS/iPadOS)
+    #    and raises one of three specific error classes we dispatch on.
+    successful: list[str] = []
+    offline: list[str] = []
+    hard_failed: list[tuple[str, str]] = []
+    at_cap: list[tuple[str, list[str]]] = []
+
     for device in compatible:
         try:
-            tunnel = pymd3.tunnel_for_pair_id(device.pair_record_identifier)
+            emit(f"installing to {device.name}")
+            installer.install_for_device(
+                device,
+                signed_path,
+                signed_bundle_id=ipa.signed_bundle_id,
+            )
         except pymd3.TunneldDownError as e:
+            # tunneld outage affects every device; propagate.
             _record_failure(ipa, "tunneld-down", str(e))
             emit("tunneld went down mid-refresh")
             raise RefreshAborted("tunneld down") from e
-        if tunnel is None:
-            log.warning(
-                "target %s has no active tunnel; skipping install",
-                device.name,
+        except installer.DeviceOfflineError as e:
+            offline.append(device.name)
+            emit(str(e))
+        except installer.DeviceAtCapError as e:
+            at_cap.append((device.name, e.external_bundle_ids))
+            emit(
+                f"{device.name} at 3-app cap; installed bundles: "
+                f"{', '.join(e.external_bundle_ids)}"
             )
-            all_installs_ok = False
-            continue
-        addr, port = tunnel
-        try:
-            emit(f"installing to {device.name}")
-            pymd3.install_ipa(
-                addr,
-                port,
-                signed_path,
-                terminate_bundle_id=ipa.signed_bundle_id,
-            )
-        except pymd3.InstallError as e:
-            _record_failure(ipa, "install-failed", str(e))
-            emit(f"install to {device.name} failed: {e}")
-            all_installs_ok = False
+        except installer.InstallFailedError as e:
+            hard_failed.append((device.name, str(e)))
+            emit(f"{device.name}: install failed: {e}")
+        else:
+            successful.append(device.name)
+            ipa.last_installed_at = _now_iso()
 
-    if all_installs_ok:
-        _record_success(ipa)
-        emit("done")
-        return True
-    return False
+    # 4. Classify the overall outcome.
+    #    - All successful  -> mark fresh, clear strikes.
+    #    - Any hard fail   -> install-failed status + strike (we retry).
+    #    - Any at-cap      -> device-at-cap status, NO strike (user must
+    #                         free a slot; Apple will reject every attempt
+    #                         until they do, so hammering it would only
+    #                         burn our app-ID weekly budget).
+    #    - Offline only    -> no status change, no strike; signed IPA is
+    #                         fresh on disk but not marked last_signed_at
+    #                         so needs_refresh stays True for next tick.
+    #    - Partial success -> update last_signed_at (signing did happen),
+    #                         set "partial" status, no strike.
+    if hard_failed and not offline and not at_cap:
+        dev_name, err = hard_failed[0]
+        _record_failure(ipa, "install-failed", f"{dev_name}: {err}")
+        return False
+    if at_cap:
+        dev_name, bundles = at_cap[0]
+        msg = (
+            f"{dev_name} at free-tier 3-app cap; free a slot by "
+            f"uninstalling one of: {', '.join(bundles)}"
+        )
+        _record_soft_failure(ipa, "device-at-cap", msg)
+        return False
+    if hard_failed:
+        dev_name, err = hard_failed[0]
+        _record_failure(ipa, "install-failed", f"{dev_name}: {err}")
+        return False
+    if successful and offline:
+        ipa.last_signed_at = _now_iso()
+        _record_soft_failure(
+            ipa,
+            "partial",
+            f"installed on {', '.join(successful)}; "
+            f"offline: {', '.join(offline)}",
+        )
+        return False
+    if offline and not successful:
+        _record_soft_failure(
+            ipa,
+            "device-offline",
+            f"all targets offline: {', '.join(offline)}",
+        )
+        return False
+
+    _record_success(ipa)
+    emit("done")
+    return True
 
 
 def _read_signed_bundle_id(ipa_path: Path) -> str | None:

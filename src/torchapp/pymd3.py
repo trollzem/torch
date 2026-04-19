@@ -140,7 +140,16 @@ def _run_pymd3(args: list[str], *, timeout: float = 60.0) -> subprocess.Complete
     cmd = ["pymobiledevice3", *args]
     log.debug("pymobiledevice3 run: %s", " ".join(args))
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout
+        cmd,
+        capture_output=True,
+        text=True,
+        # launchd strips LANG/LC_ALL; without an explicit encoding Python
+        # falls back to ASCII and any non-ASCII byte in stdout crashes
+        # subprocess.communicate. Device names with curly apostrophes
+        # (e.g. "Hazem's iPad") trip this — force UTF-8 decoding.
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
     )
 
 

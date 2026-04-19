@@ -62,7 +62,14 @@ class IPA:
 
 @dataclass
 class Settings:
-    refresh_interval_days: int = 6
+    # 5-day cadence (not 6) gives us 48 hourly retry attempts before the
+    # 7-day free-tier profile expires. The reason: iOS devices have
+    # aggressive Wi-Fi power-save — the iPhone/iPad can be unreachable
+    # for stretches of minutes-to-hours at a time even when "awake and
+    # on Wi-Fi". A single refresh attempt can legitimately find every
+    # iOS target offline; we need enough retry runway to eventually
+    # catch all targets in a reachable state before the profile dies.
+    refresh_interval_days: int = 5
     auto_refresh_paused: bool = False
     start_at_login: bool = True
 
@@ -100,10 +107,18 @@ class Config:
         return cls._from_dict(data)
 
     def save(self) -> None:
+        """Write config to disk atomically.
+
+        Writes to a sibling temp file then renames over the target. On
+        POSIX `os.rename` is atomic within the same directory, so
+        readers never see a half-written file even if two threads save
+        concurrently. Without this, concurrent saves (hourly refresh +
+        iOS auto-detect worker) could interleave and corrupt the JSON.
+        """
         paths.ensure_dirs()
-        paths.CONFIG_FILE.write_text(
-            json.dumps(asdict(self), indent=2, default=str)
-        )
+        tmp = paths.CONFIG_FILE.with_name(paths.CONFIG_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(asdict(self), indent=2, default=str))
+        tmp.replace(paths.CONFIG_FILE)
 
     @classmethod
     def _from_dict(cls, data: dict) -> Config:
@@ -320,12 +335,26 @@ def copy_project_ipas_into_runtime() -> None:
             shutil.copy2(src, dest)
 
 
+def platform_matches_device(ipa_platform: str, device_class: str) -> bool:
+    """Whether an IPA's platform is compatible with a device's class.
+
+    Lives here (not refresh.py) because config-time auto-targeting needs
+    it and refresh imports config — keeping the predicate here avoids a
+    circular import. refresh.is_compatible delegates to this.
+    """
+    if ipa_platform == "tvOS":
+        return device_class == "tvOS"
+    return device_class in ("iOS", "iPadOS")
+
+
 def _make_ipa_entry(ipa_file: Path, devices: list[Device]) -> IPA | None:
     """Create a new IPA entry for a freshly discovered file.
 
-    Auto-targets every currently-known device. The refresh module will
-    filter by platform compatibility, so targeting an iPhone with a tvOS
-    IPA is a no-op (not an error).
+    Auto-targets every platform-compatible device. tvOS IPAs only target
+    Apple TVs; iOS/iPadOS IPAs only target iPhones/iPads. Earlier versions
+    targeted every device and relied on the refresh-time platform filter,
+    but that left iPhones in tvOS IPAs' target lists, which confused both
+    the UI and anyone reading config.json.
     """
     try:
         platform, bundle_id = _detect_ipa_platform(ipa_file)
@@ -338,7 +367,11 @@ def _make_ipa_entry(ipa_file: Path, devices: list[Device]) -> IPA | None:
         original_bundle_id=bundle_id,
         platform=platform,
         added_at=_now_iso(),
-        target_devices=[d.pair_record_identifier for d in devices],
+        target_devices=[
+            d.pair_record_identifier
+            for d in devices
+            if platform_matches_device(platform, d.device_class)
+        ],
     )
 
 

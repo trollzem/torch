@@ -138,6 +138,13 @@ def _run_plumesign(
         env=_env(force_tvos=force_tvos, preserve_staging=preserve_staging),
         capture_output=True,
         text=True,
+        # launchd-spawned py2app processes inherit an empty LANG/LC_ALL
+        # env, which makes Python fall back to ASCII for subprocess
+        # text-mode decoding. Apple device names ("Hazem's iPad" with
+        # U+2019) then crash subprocess.communicate on the 0xe2 byte.
+        # Force UTF-8 everywhere we capture subprocess output.
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
     if check and result.returncode != 0:
@@ -457,6 +464,8 @@ def _rezip_staging_to_ipa(stage_dir: Path, output_ipa: Path) -> None:
         cwd=str(stage_dir),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=300,
     )
     if result.returncode != 0:
@@ -492,6 +501,8 @@ def _verify_signed_bundle(stage_dir: Path) -> None:
         ["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
     if result.returncode != 0:

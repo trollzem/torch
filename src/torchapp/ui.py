@@ -285,6 +285,11 @@ class TorchApp(rumps.App):
         self._state_lock = threading.Lock()
         self._icon_state: str = ICON_IDLE
         self._last_config_mtime = self._config_mtime()
+        # Guards _auto_detect_ios_worker so the 5-second config watcher
+        # tick can't queue overlapping reconcile/register flows while
+        # one is already in flight (e.g. waiting on plumesign over the
+        # network).
+        self._auto_add_in_flight = False
         self._build_menu()
         # rumps.Timer runs its callback on the main thread, which is
         # exactly what we need for anything that touches self.menu /
@@ -352,6 +357,150 @@ class TorchApp(rumps.App):
             self._rebuild()
         except Exception as e:  # noqa: BLE001
             log.exception("config watcher rebuild failed: %s", e)
+
+        # Independently of config-file changes, also poll tunneld for
+        # newly USB-trusted iOS devices and auto-add them. The actual
+        # work happens on a worker so the 5s tick stays main-thread
+        # cheap even if tunneld or the Apple portal is slow.
+        self._maybe_kick_auto_detect_worker()
+
+    def _maybe_kick_auto_detect_worker(self) -> None:
+        """Spawn the iOS auto-detect worker unless one is already
+        running. Safe to call from any thread; the in-flight flag
+        prevents pile-up if the user clicks 'Check for new devices'
+        while a tick-driven worker is already mid-flight."""
+        if self._auto_add_in_flight:
+            return
+        self._auto_add_in_flight = True
+        threading.Thread(
+            target=self._auto_detect_ios_worker,
+            daemon=True,
+            name="torch-auto-detect-ios",
+        ).start()
+
+    def _auto_detect_ios_worker(self) -> None:
+        """Background worker — query tunneld for any pair_record_ids we
+        don't yet track, reconcile them via lockdown, auto-add iOS or
+        iPadOS devices to config (Apple TVs still require explicit
+        pairing because tvOS needs PIN entry on-device), and best-
+        effort register the device with Apple's portal.
+
+        Save-then-register order is deliberate: if plumesign hangs or
+        errors we still keep the device in config and the next refresh
+        cycle retries the registration. The bug we hit before this
+        existed swallowed the entire add when register_device crashed
+        with UnicodeDecodeError.
+
+        Catches `Exception` broadly because every failure mode here is
+        non-fatal: tunneld bounce, lockdown timeout, network outage,
+        portal auth drift. We log and move on; the next tick retries.
+        """
+        try:
+            try:
+                info = pymd3.tunneld_info(timeout=2.0)
+            except pymd3.TunneldDownError:
+                # tunneld not running yet (boot, restart). Silent —
+                # the next tick retries.
+                return
+
+            tracked = {d.pair_record_identifier for d in self.cfg.devices}
+            candidates = [pid for pid in info.keys() if pid not in tracked]
+            if not candidates:
+                return
+
+            added: list[cfgmod.Device] = []
+            for pid in candidates:
+                stub = cfgmod.Device(
+                    name=pid,
+                    pair_record_identifier=pid,
+                    udid=None,
+                    device_class="unknown",
+                    paired_at=datetime.now(timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                    pair_record_path=None,
+                )
+                try:
+                    reconciled = pymd3.reconcile_device(stub)
+                except pymd3.Pymd3Error as e:
+                    log.debug(
+                        "auto-detect: %s not yet reconcileable: %s",
+                        pid, e,
+                    )
+                    continue
+
+                # Auto-add only iOS / iPadOS. tvOS pair records mean
+                # the user already drove a PIN flow, but if we land
+                # here for one anyway, leave it for the explicit
+                # pairing/post-pair-reconcile path so we don't
+                # double-add.
+                if reconciled.device_class not in ("iOS", "iPadOS"):
+                    log.debug(
+                        "auto-detect: skipping %s (class=%s, "
+                        "needs explicit pairing)",
+                        reconciled.name, reconciled.device_class,
+                    )
+                    continue
+
+                # Race guard: another thread (or a previous tick) may
+                # have added it between our tunneld query and now.
+                if self.cfg.device_by_pair_record(pid) is not None:
+                    continue
+
+                # Persist BEFORE the slow Apple portal call so a
+                # plumesign hang doesn't lose the in-memory add.
+                self.cfg.devices.append(reconciled)
+                for ipa in self.cfg.ipas:
+                    if (refresh.is_compatible(
+                            ipa.platform, reconciled.device_class)
+                            and pid not in ipa.target_devices):
+                        ipa.target_devices.append(pid)
+                try:
+                    self.cfg.save()
+                except OSError as e:
+                    log.error(
+                        "auto-detect: failed to save config: %s", e
+                    )
+                    self.cfg.devices.pop()
+                    continue
+                self._last_config_mtime = self._config_mtime()
+
+                log.info(
+                    "auto-detect: added %s (%s, %s)",
+                    reconciled.name,
+                    reconciled.device_class,
+                    reconciled.product_type,
+                )
+                added.append(reconciled)
+
+                # Best-effort Apple portal registration. Broad except:
+                # subprocess.TimeoutExpired, UnicodeDecodeError, network
+                # — none of them should lose the saved device.
+                if reconciled.udid:
+                    try:
+                        plumesign.register_device(
+                            reconciled.udid, reconciled.name
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(
+                            "auto-detect: register_device failed for "
+                            "%s (will retry next refresh): %s",
+                            reconciled.udid, e,
+                        )
+
+            if added:
+                self._rebuild_async()
+                for d in added:
+                    self._notify_async(
+                        "Torch",
+                        "Device added",
+                        f"{d.name} ({d.device_class}) detected and "
+                        f"added to Torch.",
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.exception("auto-detect worker crashed: %s", e)
+        finally:
+            self._auto_add_in_flight = False
 
     # --- menu wiring ---------------------------------------------------------
 
@@ -444,6 +593,13 @@ class TorchApp(rumps.App):
                     "missing-source": "❌",
                     "no-targets": "·",
                     "tunneld-down": "⚠️",
+                    # soft-failure states: hourly retry continues, no
+                    # strikes toward freeze. Displayed with a distinct
+                    # glyph so the user sees "it's trying, it's not
+                    # permanently broken".
+                    "device-offline": "💤",
+                    "device-at-cap": "🚫",
+                    "partial": "◐",
                 }.get(ipa.status, "·")
                 label = (
                     f"{status_icon} {Path(ipa.filename).stem} · "
@@ -599,7 +755,7 @@ class TorchApp(rumps.App):
         )
         devices_item.add(
             rumps.MenuItem(
-                "Detect iPhone/iPad (via USB trust)…",
+                "Check for new iPhones/iPads now",
                 callback=self.on_add_device_ios,
             )
         )
@@ -697,8 +853,26 @@ class TorchApp(rumps.App):
         if self.cfg.cert_status.status in ("expired", "revoked", "missing"):
             self._set_icon(ICON_ERROR)
             return
-        if any(i.status not in ("ok", "pending") for i in self.cfg.ipas):
+        # Hard failures (sign-failed, install-failed, auth-error, etc.)
+        # get the error icon. Soft-failure states (device-offline,
+        # device-at-cap, partial) are retry-friendly and get the stale
+        # icon instead — they indicate "Torch is trying, waiting for
+        # user action / device wake."
+        _SOFT_FAILURES = {
+            "ok",
+            "pending",
+            "device-offline",
+            "device-at-cap",
+            "partial",
+        }
+        if any(i.status not in _SOFT_FAILURES for i in self.cfg.ipas):
             self._set_icon(ICON_ERROR)
+            return
+        if any(
+            i.status in ("device-offline", "device-at-cap", "partial")
+            for i in self.cfg.ipas
+        ):
+            self._set_icon(ICON_STALE)
             return
         if self.cfg.cert_status.status == "expiring":
             self._set_icon(ICON_STALE)
@@ -959,133 +1133,30 @@ class TorchApp(rumps.App):
         self._start_pairing_in_ui()
 
     def on_add_device_ios(self, _sender: object) -> None:
-        """Auto-detect a USB-trusted iPhone/iPad via tunneld and add it.
+        """Kick the iOS auto-detect worker immediately.
 
-        iOS devices don't have a user-visible "pair with computer"
-        screen the way tvOS does. Trust is established once via the
-        "Trust This Computer" prompt when you first plug in the USB
-        cable; from then on, usbmuxd handles the pairing transparently
-        and exposes the device over both USB and WiFi. tunneld picks
-        it up automatically. All we need to do here is enumerate
-        tunneled devices that aren't already in our config and offer
-        to add them.
-
-        This runs entirely on the main thread (rumps menu callback),
-        so rumps.alert() and config.save() are safe to call directly.
+        iOS devices don't need any in-app pairing — once you've tapped
+        "Trust This Computer" with the device plugged in via USB,
+        tunneld sees it and the auto-detect tick (every 5s) picks it
+        up. This menu item just shortcuts that wait: it fires the
+        worker right now and tells the user what to expect. No
+        confirmation dialog, no per-device prompts.
         """
-        try:
-            info = pymd3.tunneld_info()
-        except pymd3.TunneldDownError:
-            rumps.alert(
-                title="Tunneld is down",
-                message=(
-                    "Couldn't reach the background tunnel service. "
-                    "Make sure pymobiledevice3 tunneld is running."
-                ),
-            )
-            return
-
-        # Filter out devices we already track.
-        tracked_ids = {d.pair_record_identifier for d in self.cfg.devices}
-        candidates = [pid for pid in info.keys() if pid not in tracked_ids]
-
-        if not candidates:
-            rumps.alert(
-                title="No new devices",
-                message=(
-                    "Tunneld doesn't see any devices that Torch "
-                    "isn't already tracking.\n\n"
-                    "If your iPhone or iPad isn't showing up, plug it "
-                    "in with a USB cable and tap 'Trust This Computer' "
-                    "on the device. After that it'll appear here "
-                    "automatically."
-                ),
-            )
-            return
-
-        # For each candidate, try to reconcile against tunneld to get a
-        # friendly name, UDID, and device class. Skip anything that
-        # fails to reconcile (offline, lockdown failed, etc.).
-        from .config import Device
-
-        resolved: list[tuple[str, Device]] = []
-        for pid in candidates:
-            stub = Device(
-                name=pid,
-                pair_record_identifier=pid,
-                udid=None,
-                device_class="unknown",
-                paired_at=datetime.now(timezone.utc).isoformat(
-                    timespec="seconds"
-                ),
-                pair_record_path=None,
-            )
-            try:
-                reconciled = pymd3.reconcile_device(stub)
-            except pymd3.Pymd3Error as e:
-                log.warning("could not reconcile %s: %s", pid, e)
-                continue
-            resolved.append((pid, reconciled))
-
-        if not resolved:
-            rumps.alert(
-                title="No reachable devices",
-                message=(
-                    "Tunneld knows about devices but none of them could "
-                    "be queried. Make sure the target device is powered "
-                    "on and on the same network."
-                ),
-            )
-            return
-
-        # Present each resolved device as a confirmation dialog. If the
-        # user has multiple new devices we loop and ask one at a time.
-        added_count = 0
-        for pid, device in resolved:
-            name = device.name or pid
-            class_info = ""
-            if device.device_class and device.device_class != "unknown":
-                class_info = f" ({device.device_class}"
-                if device.product_type:
-                    class_info += f" · {device.product_type}"
-                if device.product_version:
-                    class_info += f" · {device.product_version}"
-                class_info += ")"
-
-            prompt = (
-                f"Found: {name}{class_info}\n\n"
-                f"Add this device to Torch? All tracked IPAs will "
-                f"be auto-targeted at it."
-            )
-            if rumps.alert(
-                title="Add device?", message=prompt, ok="Add", cancel="Skip"
-            ) != 1:
-                continue
-
-            # Append to config, auto-target existing IPAs, save, rebuild.
-            self.cfg.devices.append(device)
-            for ipa in self.cfg.ipas:
-                if pid not in ipa.target_devices:
-                    ipa.target_devices.append(pid)
-
-            # Best-effort register with Apple portal.
-            if device.udid:
-                try:
-                    plumesign.register_device(device.udid, device.name)
-                except plumesign.PlumesignError as e:
-                    log.debug("register_device %s: %s", device.udid, e)
-
-            added_count += 1
-
-        if added_count > 0:
-            self.cfg.save()
-            self._rebuild()
+        if not pymd3.is_tunneld_up():
             rumps.notification(
                 "Torch",
-                "Device added",
-                f"{added_count} device{'s' if added_count != 1 else ''} "
-                f"added. They'll be refreshed on the next cycle.",
+                "Tunneld is down",
+                "The background tunnel service isn't reachable. Open "
+                "Console for /var/log/torch-tunneld.err to investigate.",
             )
+            return
+        self._maybe_kick_auto_detect_worker()
+        rumps.notification(
+            "Torch",
+            "Looking for new devices",
+            "If your iPhone or iPad is USB-trusted and tunneld can "
+            "see it, it'll appear in the menu within a few seconds.",
+        )
 
     def _start_pairing_in_ui(self) -> None:
         """Native-UI Apple TV pairing flow.
@@ -1426,9 +1497,15 @@ class TorchApp(rumps.App):
                     "register_device failed for %s: %s", reconciled.udid, e
                 )
 
-        # Auto-target existing IPAs at the new device.
+        # Auto-target existing IPAs at the new device, but only IPAs
+        # whose platform is compatible with the new device. Otherwise
+        # an iPhone ends up in a tvOS IPA's target list as harmless
+        # noise that confuses readers of config.json.
+        new_class = (reconciled.device_class if reconciled
+                     else new_device.device_class)
         for ipa in self.cfg.ipas:
-            if pair_id not in ipa.target_devices:
+            if (refresh.is_compatible(ipa.platform, new_class)
+                    and pair_id not in ipa.target_devices):
                 ipa.target_devices.append(pair_id)
 
         self.cfg.save()

@@ -13,7 +13,11 @@
 #   2. Installs python@3.14 via brew.
 #   3. Clones Torch to ~/torch (or uses an existing checkout).
 #   4. Installs Python dependencies (rumps, keyring, pexpect, pyobjc,
-#      pymobiledevice3, py2app).
+#      pymobiledevice3, py2app) and the `ideviceinstaller` CLI used
+#      for iOS/iPadOS installs (the reliable classic-libimobiledevice
+#      path — pymd3's apps install over usbmux-Network Wi-Fi tunnels
+#      hangs mid-transfer for iOS, so we split: pymd3 for tvOS,
+#      ideviceinstaller for iOS).
 #   5. Verifies the bundled patched plumesign binary is present (or rebuilds from source).
 #   6. Builds Torch.app via py2app and copies it to /Applications/Torch.app.
 #      Bundling is what gives the process a proper CFBundleIdentifier so
@@ -32,7 +36,7 @@
 #   - tunneld runs at boot as a root LaunchDaemon
 #   - menubar auto-starts at login
 #   - drop IPAs into ~/Library/Application Support/Torch/ipas/ (or click
-#     "Add IPA..." in the menubar) and they refresh automatically every 6 days
+#     "Add IPA..." in the menubar) and they refresh automatically every 5 days
 
 set -euo pipefail
 
@@ -85,6 +89,14 @@ fi
 
 log "Ensuring python@3.14 is installed"
 brew list python@3.14 >/dev/null 2>&1 || brew install python@3.14
+
+# ideviceinstaller = classic libimobiledevice install path used for
+# iOS / iPadOS. pymobiledevice3's own `apps install --rsd` hangs
+# indefinitely mid-transfer on the `usbmux-<UDID>-Network` tunnels
+# iOS devices use, so we split: pymd3 for tvOS, ideviceinstaller for
+# iOS. Without this, iPhone/iPad refreshes never complete.
+log "Ensuring ideviceinstaller is installed (for iOS/iPadOS installs)"
+brew list ideviceinstaller >/dev/null 2>&1 || brew install ideviceinstaller
 
 # We bundle the prebuilt plumesign binary in the repo, so rust is only
 # needed if someone wants to rebuild from vendor/impactor-tvos.patch. We
@@ -242,7 +254,7 @@ No devices are paired yet. To add your first one:
        (via USB trust). Accept the "Add this device?" dialog.
 
 Then drop IPAs into ~/Library/Application Support/Torch/ipas/
-(or click the 🔥 flame → Apps → Add IPA...) and they'll auto-refresh every 6 days.
+(or click the 🔥 flame → Apps → Add IPA...) and they'll auto-refresh every 5 days.
 EOF
 else
     log "$pair_count device(s) already paired — nothing else to do."

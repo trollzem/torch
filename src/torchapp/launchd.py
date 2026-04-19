@@ -82,7 +82,11 @@ class LaunchdError(Exception):
 def _resolve_binary(name: str) -> str:
     """Resolve a CLI name to an absolute path via `which`."""
     result = subprocess.run(
-        ["/usr/bin/which", name], capture_output=True, text=True
+        ["/usr/bin/which", name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise LaunchdError(f"could not find {name} on PATH")
@@ -221,11 +225,15 @@ def install_launch_agent() -> None:
         ["launchctl", "bootout", target, str(APP_PLIST_PATH)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     result = subprocess.run(
         ["launchctl", "bootstrap", target, str(APP_PLIST_PATH)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         raise LaunchdError(
@@ -243,6 +251,8 @@ def uninstall_launch_agent() -> None:
         ["launchctl", "bootout", target, str(APP_PLIST_PATH)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if APP_PLIST_PATH.exists():
         APP_PLIST_PATH.unlink()
@@ -267,6 +277,8 @@ def _run_as_admin(shell_script: str) -> None:
         ["osascript", "-e", full_script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if result.returncode != 0:
         raise LaunchdError(
@@ -325,6 +337,8 @@ def is_service_loaded(label: str, *, domain: str) -> bool:
         ["launchctl", "print", f"{domain}/{label}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return result.returncode == 0
 
