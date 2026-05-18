@@ -415,7 +415,14 @@ def refresh_one(
         )
         ipa.signed_bundle_id = _read_signed_bundle_id(signed_path)
     except plumesign.PlumesignNotLoggedInError as e:
-        _record_failure(ipa, "needs-login", str(e))
+        # Session expired / no account selected: user must re-login via
+        # the menubar. Until they do, no retry succeeds. Treat this as
+        # a soft failure so we don't burn the 3-strike freeze counter
+        # while waiting — a stale GSA session shouldn't permanently
+        # disable refresh for every IPA. On successful re-login, the
+        # ui.py login handler clears strikes + statuses so any frozen
+        # IPAs immediately resume.
+        _record_soft_failure(ipa, "needs-login", str(e))
         emit("not logged in; aborting run")
         raise RefreshAborted("plumesign session missing") from e
     except plumesign.PlumesignAppIdLimitError as e:

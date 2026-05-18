@@ -172,6 +172,16 @@ def _classify_failure_and_raise(stderr: str) -> None:
         raise PlumesignAppIdLimitError(_tail(stderr, 10))
     if "no accounts" in lower or "no account selected" in lower:
         raise PlumesignNotLoggedInError(_tail(stderr, 10))
+    # Apple's "Developer API error 1100: Your session has expired. Please
+    # log in." comes back through the normal sign/cert pipeline — not as
+    # a missing-account error. We need to recognize it as needs-login so
+    # refresh marks the IPA "needs-login" (instead of "sign-failed",
+    # which gets treated as a hard failure and burns toward the 3-strike
+    # freeze). Without this, a stale GSA session silently freezes every
+    # tracked IPA after 3 hourly attempts and the only fix is manually
+    # clearing consecutive_failures.
+    if "session has expired" in lower or "please log in" in lower:
+        raise PlumesignNotLoggedInError(_tail(stderr, 10))
     if "authentication" in lower or "unauthorized" in lower or "srp" in lower:
         raise PlumesignAuthError(_tail(stderr, 10))
     if "unexpectedendofeventstream" in lower or "plist error" in lower:
@@ -229,19 +239,53 @@ def login(
     try:
         idx = child.expect(patterns)
         if idx == 0:
-            code = tfa_callback().strip()
-            if not code:
-                raise PlumesignAuthError("empty 2FA code provided")
-            log.info("sending 2FA code to plumesign")
-            child.sendline(code)
-            # After 2FA, wait for the success marker or EOF.
-            inner = child.expect(
-                [r"Successfully logged in", pexpect.EOF, pexpect.TIMEOUT]
-            )
-            if inner != 0:
+            # 2FA loop: Apple sometimes rejects the code (expired,
+            # mistyped, or codes from a different sign-in event got
+            # crossed) and plumesign re-prompts "Enter 2FA code:". We
+            # need to re-call tfa_callback() so the user can enter a
+            # FRESH code from the trusted device, instead of leaving
+            # plumesign hanging on stdin while pexpect waits for a
+            # "Successfully logged in" that will never arrive.
+            for attempt in range(3):
+                code = tfa_callback().strip()
+                if not code:
+                    raise PlumesignAuthError("empty 2FA code provided")
+                log.info(
+                    "sending 2FA code to plumesign (attempt %d/3)",
+                    attempt + 1,
+                )
+                child.sendline(code)
+                inner = child.expect(
+                    [
+                        r"Successfully logged in",
+                        r"Enter 2FA code:",
+                        pexpect.EOF,
+                        pexpect.TIMEOUT,
+                    ]
+                )
+                if inner == 0:
+                    break  # success
+                if inner == 1:
+                    log.info(
+                        "plumesign re-prompted for 2FA — previous "
+                        "code rejected by Apple; asking user again"
+                    )
+                    continue  # ask user for another code
+                if inner == 2:
+                    raise PlumesignAuthError(
+                        f"plumesign exited mid-2FA: "
+                        f"{(child.before or '')[-500:]}"
+                    )
                 raise PlumesignAuthError(
-                    f"2FA rejected or login never completed: "
+                    f"timed out after sending 2FA code: "
                     f"{(child.before or '')[-500:]}"
+                )
+            else:
+                raise PlumesignAuthError(
+                    "Apple rejected 2FA code 3 times in a row — "
+                    "verify the code shown on your trusted device "
+                    "matches exactly and enter it within ~30s of "
+                    "it appearing."
                 )
         elif idx == 1:
             # Logged in without ever asking for 2FA (already-trusted session reuse).

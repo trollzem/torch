@@ -1112,10 +1112,38 @@ class TorchApp(rumps.App):
             except Exception as e:  # noqa: BLE001
                 log.warning("keychain store failed (non-fatal): %s", e)
 
+            # Re-login fixes any IPAs that had been frozen by repeated
+            # sign-failed / needs-login attempts against the previously-
+            # expired session. Clear consecutive_failures and the
+            # error/status fields so the next refresh tick picks them
+            # up fresh instead of skipping past is_frozen(). Without
+            # this the user would re-login successfully and the IPAs
+            # would silently stay frozen until they noticed and forced
+            # a per-app refresh.
+            cleared = 0
+            for ipa in self.cfg.ipas:
+                if ipa.consecutive_failures or ipa.status in (
+                    "needs-login", "sign-failed", "auth-error"
+                ):
+                    ipa.consecutive_failures = 0
+                    ipa.last_error = None
+                    if ipa.status in ("needs-login", "sign-failed", "auth-error"):
+                        ipa.status = "pending"
+                    cleared += 1
+            if cleared:
+                self.cfg.save()
+                log.info(
+                    "cleared frozen state on %d IPA(s) after successful "
+                    "re-login", cleared,
+                )
+
             self._notify_async(
                 "Torch", "Signed in", f"Logged in as {email}."
             )
             self._rebuild_async()
+            # Kick a refresh right away so the unfrozen IPAs catch up
+            # without waiting for the next hourly tick.
+            _on_main_thread(lambda: self._background_check(force=False))
         except plumesign.PlumesignAuthError as e:
             log.warning("apple id login failed: %s", e)
             self._notify_async(
