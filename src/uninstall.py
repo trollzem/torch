@@ -72,6 +72,13 @@ def main() -> int:
         except launchd.LaunchdError as e:
             print(f"[!] {e}", file=sys.stderr)
             return 2
+        print("[+] Removing tunneld-keepalive LaunchDaemon")
+        try:
+            launchd.uninstall_tunneld_keepalive()
+        except launchd.LaunchdError as e:
+            print(f"[!] {e}", file=sys.stderr)
+            # non-fatal — keepalive removal failure shouldn't block
+            # the uninstall path
 
     print("Done. User data in ~/Library/Application Support/Torch/ is untouched.")
     return 0

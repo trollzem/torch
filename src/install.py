@@ -229,6 +229,26 @@ def main() -> int:
             return 2
         print(f"[+] {launchd.TUNNELD_LABEL} is running as a system service")
 
+        # Watchdog: kicks tunneld every 30 min if its uptime > 7 days
+        # or its inventory has been empty for >6h despite pair records
+        # on disk. Prevents the failure mode the user hit 2026-06-20
+        # where tunneld at 44 days uptime had silently lost mDNS
+        # discovery and reported zero devices. Same admin dialog —
+        # rolled into the same sudo session if AppleScript caches it.
+        print(f"[+] Installing {launchd.TUNNELD_KEEPALIVE_LABEL} watchdog")
+        try:
+            launchd.install_tunneld_keepalive()
+        except launchd.LaunchdError as e:
+            print(
+                f"[!] tunneld-keepalive install failed: {e}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"[+] {launchd.TUNNELD_KEEPALIVE_LABEL} is running "
+            f"(checks every 30 min)"
+        )
+
     if args.agent:
         print("[+] Installing Torch menubar LaunchAgent")
         try:
@@ -242,10 +262,11 @@ def main() -> int:
         )
 
     print()
-    print("Done. Both services are set to auto-start on login/boot.")
+    print("Done. Services are set to auto-start on login/boot.")
     print("Logs:")
-    print(f"  tunneld: {launchd.TUNNELD_LOG_OUT}")
-    print(f"  app:     {paths.LOG_FILE}")
+    print(f"  tunneld:           {launchd.TUNNELD_LOG_OUT}")
+    print(f"  tunneld-keepalive: {launchd.TUNNELD_KEEPALIVE_LOG}")
+    print(f"  app:               {paths.LOG_FILE}")
     return 0
 
 

@@ -63,16 +63,26 @@ def _pymobiledevice3_bin() -> Path:
 log = logging.getLogger(__name__)
 
 TUNNELD_LABEL = "com.torch.tunneld"
+TUNNELD_KEEPALIVE_LABEL = "com.torch.tunneld-keepalive"
 APP_LABEL = "com.torch.app"
 
 SYSTEM_LAUNCHDAEMONS_DIR = Path("/Library/LaunchDaemons")
 USER_LAUNCHAGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 
 TUNNELD_PLIST_PATH = SYSTEM_LAUNCHDAEMONS_DIR / f"{TUNNELD_LABEL}.plist"
+TUNNELD_KEEPALIVE_PLIST_PATH = (
+    SYSTEM_LAUNCHDAEMONS_DIR / f"{TUNNELD_KEEPALIVE_LABEL}.plist"
+)
 APP_PLIST_PATH = USER_LAUNCHAGENTS_DIR / f"{APP_LABEL}.plist"
 
 TUNNELD_LOG_OUT = Path("/var/log/torch-tunneld.out")
 TUNNELD_LOG_ERR = Path("/var/log/torch-tunneld.err")
+TUNNELD_KEEPALIVE_LOG = Path("/var/log/torch-tunneld-keepalive.log")
+
+# Watchdog tick: every 30 minutes is fast enough to catch stale
+# tunneld within an hour without burning meaningful CPU/disk on
+# the steady-state "nothing to do" case.
+TUNNELD_KEEPALIVE_INTERVAL_SECONDS = 1800
 
 
 class LaunchdError(Exception):
@@ -135,6 +145,59 @@ def tunneld_plist() -> dict:
         # Long-running service; no timeout. If it exits, launchd
         # respawns via KeepAlive.
         "ThrottleInterval": 30,
+    }
+
+
+def tunneld_keepalive_plist() -> dict:
+    """LaunchDaemon plist for the tunneld watchdog.
+
+    Runs `python3 -m torchapp.tunneld_keepalive` every 30 minutes.
+    Inherits the same HOME/PATH treatment as the main tunneld daemon
+    so the watchdog can read pair records from the user's home dir
+    while executing as root.
+
+    Why a separate daemon (not a timer inside Torch.app): the watchdog
+    needs to issue `launchctl kickstart -k system/...` which requires
+    root. Torch.app runs as the user and can't sudo. Splitting the
+    keepalive into its own root LaunchDaemon keeps the privilege
+    surface minimal (one script, only kickstarts the sibling tunneld
+    daemon) without coupling it to the menubar lifecycle.
+    """
+    python_bin = str(_current_python())
+    user_home = str(Path.home())
+    return {
+        "Label": TUNNELD_KEEPALIVE_LABEL,
+        # `python -m torchapp.tunneld_keepalive` runs the script as a
+        # module so it imports cleanly even when invoked from
+        # /Library/LaunchDaemons. The same venv python that owns the
+        # main install also has the torchapp package on sys.path.
+        "ProgramArguments": [
+            python_bin,
+            "-m",
+            "torchapp.tunneld_keepalive",
+        ],
+        "EnvironmentVariables": {
+            "HOME": user_home,
+            "PATH": os.environ.get(
+                "PATH",
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            ),
+            # Resolve `torchapp.tunneld_keepalive` from the source tree
+            # the venv python already imports from. install.py guards
+            # this — if the venv python's site-packages can't find
+            # torchapp, the watchdog won't run, but we tolerate that
+            # because the watchdog is non-critical (worst case: user
+            # restarts tunneld manually like they did today).
+            "PYTHONPATH": str(paths.PROJECT_ROOT / "src"),
+        },
+        "RunAtLoad": True,
+        "StartInterval": TUNNELD_KEEPALIVE_INTERVAL_SECONDS,
+        "StandardOutPath": str(TUNNELD_KEEPALIVE_LOG),
+        "StandardErrorPath": str(TUNNELD_KEEPALIVE_LOG),
+        # Throttle prevents runaway respawn if the script errors out
+        # immediately. With StartInterval driving the cadence we don't
+        # need KeepAlive — exiting cleanly between ticks is correct.
+        "ThrottleInterval": 60,
     }
 
 
@@ -326,6 +389,43 @@ def uninstall_launch_daemon() -> None:
     ]
     _run_as_admin(" && ".join(commands))
     log.info("LaunchDaemon %s removed", TUNNELD_LABEL)
+
+
+def install_tunneld_keepalive() -> None:
+    """Write + bootstrap the tunneld watchdog LaunchDaemon as root.
+
+    Same shape as install_launch_daemon but for the keepalive job.
+    Single admin-privileged shell-script call moves the staging plist
+    into /Library/LaunchDaemons/, sets ownership, touches the log
+    file, and bootstraps. Idempotent — bootout first so a re-install
+    swaps the plist cleanly.
+    """
+    staging = paths.APP_SUPPORT_DIR / f"{TUNNELD_KEEPALIVE_LABEL}.plist.staging"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.write_bytes(_write_plist_bytes(tunneld_keepalive_plist()))
+    target_plist = str(TUNNELD_KEEPALIVE_PLIST_PATH)
+    commands = [
+        f"mv '{staging}' '{target_plist}'",
+        f"chown root:wheel '{target_plist}'",
+        f"chmod 644 '{target_plist}'",
+        f"touch '{TUNNELD_KEEPALIVE_LOG}'",
+        f"chmod 644 '{TUNNELD_KEEPALIVE_LOG}'",
+        f"launchctl bootout system '{target_plist}' 2>/dev/null || true",
+        f"launchctl bootstrap system '{target_plist}'",
+    ]
+    _run_as_admin(" && ".join(commands))
+    log.info("LaunchDaemon %s is loaded", TUNNELD_KEEPALIVE_LABEL)
+
+
+def uninstall_tunneld_keepalive() -> None:
+    """Bootout + remove the keepalive LaunchDaemon as root."""
+    target_plist = str(TUNNELD_KEEPALIVE_PLIST_PATH)
+    commands = [
+        f"launchctl bootout system '{target_plist}' 2>/dev/null || true",
+        f"rm -f '{target_plist}'",
+    ]
+    _run_as_admin(" && ".join(commands))
+    log.info("LaunchDaemon %s removed", TUNNELD_KEEPALIVE_LABEL)
 
 
 # --- Status helpers ----------------------------------------------------------

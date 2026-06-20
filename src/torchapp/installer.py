@@ -272,9 +272,18 @@ def _install_ios(
             timeout=_IDEVICEINSTALLER_TIMEOUT,
         )
     except subprocess.TimeoutExpired as e:
-        raise InstallFailedError(
-            f"{device.name}: ideviceinstaller timed out after "
-            f"{_IDEVICEINSTALLER_TIMEOUT:.0f}s"
+        # Hitting the 240s install timeout almost always means the
+        # iOS device's Wi-Fi went into power-save mid-transfer and
+        # the AFC stream stalled — same offline-ish failure mode as
+        # the pre-install reachability check missing the device.
+        # Classify as offline (soft failure, no strike bump) instead
+        # of install-failed (hard failure, freeze after 3 strikes).
+        # A genuine install error fails much faster and parses into
+        # one of the other error paths above.
+        raise DeviceOfflineError(
+            f"{device.name}: install transfer stalled past "
+            f"{_IDEVICEINSTALLER_TIMEOUT:.0f}s (device likely "
+            f"slept mid-transfer); retrying next cycle"
         ) from e
     except FileNotFoundError as e:
         raise InstallFailedError(
