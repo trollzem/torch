@@ -58,6 +58,21 @@ class IPA:
     status: str = "pending"  # pending | ok | sign-failed | install-failed | app-id-limit
     consecutive_failures: int = 0
     last_error: str | None = None
+    # Per-device install timestamps. Keyed by pair_record_identifier;
+    # value is the ISO8601 UTC time of the most recent successful
+    # install on that specific device. last_installed_at above is
+    # IPA-wide (set whenever any target succeeds) and was historically
+    # the only signal -- which masked the failure mode where, say, the
+    # iPad got refreshed but the iPhone went weeks without an install
+    # because it was chronically asleep. Apple's free-tier profile
+    # expires 7 days after install per-device, so we need per-device
+    # timestamps to know what's actually about to break.
+    installs: dict[str, str] = field(default_factory=dict)
+    # State for per-device expiry-imminent notifications. Keyed
+    # similarly; value is the ISO date string of the last day we
+    # surfaced a notification for this device's profile expiring.
+    # Dedupes notifications to once per UTC day per (ipa, device).
+    expiry_notified: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

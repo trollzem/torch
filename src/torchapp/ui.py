@@ -640,6 +640,24 @@ class TorchApp(rumps.App):
                         d_label = device.name
                         if device.product_type:
                             d_label += f" · {device.product_type}"
+                        # Append per-device expiry countdown when this
+                        # device is a target and we have an install
+                        # record for it. Without this, a chronically
+                        # unreachable device (iPhone in long Wi-Fi
+                        # sleep) could let its profile expire silently
+                        # while the IPA's IPA-wide status shows "ok".
+                        if is_target:
+                            hours_left = refresh.device_expires_in_hours(
+                                ipa, device.pair_record_identifier
+                            )
+                            if hours_left is not None:
+                                if hours_left <= 0:
+                                    d_label += " · EXPIRED"
+                                elif hours_left <= refresh.DEVICE_EXPIRY_WARNING_HOURS:
+                                    d_label += f" · ⚠ {hours_left:.0f}h left"
+                                else:
+                                    days_left = hours_left / 24
+                                    d_label += f" · {days_left:.1f}d left"
 
                         # Default args bind loop vars at each iteration,
                         # same pattern as _refresh_cb / _remove_cb above.
@@ -1615,6 +1633,31 @@ class TorchApp(rumps.App):
                 "Refresh partial",
                 f"{succeeded} succeeded, {failed} failed",
             )
+
+        # After a cycle ends, look for (IPA, device) pairs whose
+        # on-device profile is about to expire without a fresh
+        # install. The chronic-offline-device pattern (iPhone in
+        # long Wi-Fi sleep) doesn't burn refresh strikes, doesn't
+        # surface as a hard error -- and used to silently let a
+        # specific device's YouTube expire on day 7 with no warning.
+        # find_imminent_expiries mutates dedup state and the
+        # snapshot is what got saved by refresh_all's `finally`,
+        # so re-load before reading.
+        try:
+            cfg_snapshot = cfgmod.Config.load()
+            expiring = refresh.find_imminent_expiries(cfg_snapshot)
+            if expiring:
+                cfg_snapshot.save()
+                for ipa, device, hours_left in expiring:
+                    self._notify_async(
+                        "Torch",
+                        f"{ipa.filename} expires soon on {device.name}",
+                        f"{hours_left:.0f}h left and the device has been "
+                        f"unreachable. Wake/connect it to refresh.",
+                    )
+        except Exception as e:  # noqa: BLE001
+            log.exception("expiry-warning check failed: %s", e)
+
         self._reload_and_rebuild_async()
 
     def _reload_and_rebuild_async(self) -> None:

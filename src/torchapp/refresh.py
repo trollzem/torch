@@ -119,6 +119,131 @@ def is_frozen(ipa: IPA) -> bool:
     return ipa.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
 
 
+# Free-tier profiles expire 7 days after install, per-device.
+FREE_TIER_PROFILE_LIFETIME = timedelta(days=7)
+
+# Threshold for "this device is about to lose its profile and we
+# haven't been able to refresh it." 24h gives the user a full day
+# of warning during which a wake/charge of the device is plenty of
+# runway for the next refresh tick to catch them.
+DEVICE_EXPIRY_WARNING_HOURS = 24
+
+
+def device_expires_at(
+    ipa: IPA, pair_record_identifier: str
+) -> datetime | None:
+    """When this specific device's on-device profile expires.
+
+    Uses the per-device install timestamp from `ipa.installs` if
+    present (the post-2026-06-27 data model). Falls back to the
+    IPA-wide `last_installed_at` for IPAs that haven't been
+    refreshed since the per-device tracking was added. Returns
+    None if we have no install record for this device at all.
+    """
+    iso = ipa.installs.get(pair_record_identifier) or ipa.last_installed_at
+    if not iso:
+        return None
+    parsed = _parse_iso(iso)
+    if parsed is None:
+        return None
+    return parsed + FREE_TIER_PROFILE_LIFETIME
+
+
+def device_expires_in_hours(
+    ipa: IPA, pair_record_identifier: str, now: datetime | None = None
+) -> float | None:
+    """Hours until this device's profile expires, or None if unknown.
+    Negative if already expired."""
+    expires_at = device_expires_at(ipa, pair_record_identifier)
+    if expires_at is None:
+        return None
+    if now is None:
+        now = _now()
+    return (expires_at - now).total_seconds() / 3600.0
+
+
+def any_target_device_stale(
+    ipa: IPA, cfg: Config, interval_days: int, now: datetime | None = None
+) -> bool:
+    """True if any compatible target device hasn't received an install
+    within `interval_days`.
+
+    This is the per-device complement to `needs_refresh`. needs_refresh
+    is keyed on IPA-wide `last_signed_at`, which gets bumped whenever
+    ANY device successfully installs. The chronic-offline failure
+    pattern (iPad refreshes ok, iPhone perpetually asleep) bumps
+    last_signed_at and silently locks out further refresh attempts for
+    interval_days while the iPhone's profile expires. This predicate
+    fires a fresh refresh whenever any reachable target lags.
+
+    Returns False if a device has never been installed AND the IPA
+    has never been signed (caught by needs_refresh's null-check
+    instead). True only when there's evidence of a previous success
+    on some device but a specific target is now stale relative to
+    that history.
+    """
+    if now is None:
+        now = _now()
+    threshold = timedelta(days=interval_days)
+    for pair_id in ipa.target_devices:
+        device = cfg.device_by_pair_record(pair_id)
+        if device is None or device.device_class == "unknown":
+            continue
+        if not is_compatible(ipa.platform, device.device_class):
+            continue
+        install_iso = ipa.installs.get(pair_id)
+        if install_iso is None:
+            # No per-device record. If the IPA was signed in the past,
+            # this device may have legitimately never installed (e.g.
+            # newly-targeted), in which case we should try. If the IPA
+            # has never been signed at all, needs_refresh handles it.
+            if ipa.last_signed_at is not None:
+                return True
+            continue
+        install_at = _parse_iso(install_iso)
+        if install_at is None:
+            return True
+        if (now - install_at) >= threshold:
+            return True
+    return False
+
+
+def find_imminent_expiries(
+    cfg: Config, now: datetime | None = None
+) -> list[tuple[IPA, Device, float]]:
+    """Return every (ipa, device, hours_left) where the device's
+    on-device profile expires within DEVICE_EXPIRY_WARNING_HOURS
+    and we haven't already warned about this pair today.
+
+    Mutates `ipa.expiry_notified` to dedup notifications -- the
+    caller is responsible for `cfg.save()` after consuming the
+    results. Once a (ipa, device) successfully refreshes, the
+    success path in refresh_one clears the dedup entry so the
+    warning fires fresh next time it lapses.
+    """
+    if now is None:
+        now = _now()
+    today = now.date().isoformat()
+    out: list[tuple[IPA, Device, float]] = []
+    for ipa in cfg.ipas:
+        for pair_id in ipa.target_devices:
+            device = cfg.device_by_pair_record(pair_id)
+            if device is None or device.device_class == "unknown":
+                continue
+            if not is_compatible(ipa.platform, device.device_class):
+                continue
+            hours_left = device_expires_in_hours(ipa, pair_id, now=now)
+            if hours_left is None:
+                continue
+            if hours_left > DEVICE_EXPIRY_WARNING_HOURS:
+                continue
+            if ipa.expiry_notified.get(pair_id) == today:
+                continue
+            ipa.expiry_notified[pair_id] = today
+            out.append((ipa, device, hours_left))
+    return out
+
+
 def refresh_cert_status(cfg: Config) -> CertStatus:
     """Query Apple's developer portal for the current cert and update
     cfg.cert_status in place.
@@ -474,7 +599,20 @@ def refresh_one(
             emit(f"{device.name}: install failed: {e}")
         else:
             successful.append(device.name)
-            ipa.last_installed_at = _now_iso()
+            now_iso = _now_iso()
+            ipa.last_installed_at = now_iso
+            # Record per-device install timestamp so we can compute
+            # this specific device's profile expiry. last_installed_at
+            # above is shared across all targets and only tells us
+            # "something got installed"; the per-device timestamp is
+            # what we need to warn the user when a particular device
+            # is approaching the 7-day expiry without a successful
+            # refresh.
+            ipa.installs[device.pair_record_identifier] = now_iso
+            # Clear any prior expiry-imminent notification dedup
+            # state for this device so future notifications fire
+            # cleanly if it goes offline again.
+            ipa.expiry_notified.pop(device.pair_record_identifier, None)
 
     # 4. Classify the overall outcome.
     #    - All successful  -> mark fresh, clear strikes.
@@ -638,7 +776,11 @@ def _refresh_all_locked(
         for ipa in cfg.ipas
         if (only_set is None or ipa.filename in only_set)
         and not is_frozen(ipa)
-        and (force or needs_refresh(ipa, interval))
+        and (
+            force
+            or needs_refresh(ipa, interval)
+            or any_target_device_stale(ipa, cfg, interval)
+        )
     ]
     if not candidates:
         emit("nothing to refresh")
@@ -666,4 +808,15 @@ def _refresh_all_locked(
         cfg.save()
 
     emit(f"refresh complete: {succeeded} succeeded, {failed} failed")
+
+    # Surface any (IPA, device) pair that's about to expire without a
+    # successful install in sight. Catches the chronic-offline case
+    # (device asleep for the whole interval) before the user finds
+    # YouTube broken on their phone. See find_imminent_expiries.
+    expiring = find_imminent_expiries(cfg)
+    for ipa, device, hours_left in expiring:
+        emit(
+            f"expiry warning: {ipa.filename} on {device.name} "
+            f"expires in {hours_left:.1f}h"
+        )
     return (succeeded, failed)
