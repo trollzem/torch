@@ -140,6 +140,21 @@ Raised when:
 - `ideviceinstaller` install transfer stalled past the 240s
   timeout (iOS / iPadOS; treated as "iPhone Wi-Fi dozed
   mid-transfer," not as a real install failure)
+- `ideviceinstaller` output matches a transient reachability error
+  rather than a real install rejection:
+  - an AFC transport-level error (`AFC Write error`, `AFC Read
+    error`, or a partial `wrote only N of M` write) — the bulk
+    transfer dropped mid-stream. Confirmed 2026-07-09: `AFC Write
+    error: 30` / `wrote only 0 of 1048576` froze `YouTube-iOS.ipa`
+    for a week even though the very next manual retry succeeded
+    instantly.
+  - `No device found with udid ...` — the pre-flight `idevice_id
+    -n` Bonjour probe saw the device, but it had already dropped
+    off Wi-Fi by the time `ideviceinstaller` connected. Confirmed
+    2026-07-09, same session/IPA, the iPad target.
+
+  `_TRANSIENT_IOS_ERR_RE` in `installer.py` recognizes both and
+  raises `DeviceOfflineError` instead of `InstallFailedError`.
 
 Result in `refresh.py`: `_record_soft_failure(ipa, "device-offline", ...)`
 or `"partial"` if some siblings succeeded. **Does not bump
@@ -171,7 +186,8 @@ strikes** — hammering Apple won't free the slot, the user has to.
 
 Raised for everything else: unrecognized error patterns,
 non-zero exit with empty stderr, `ideviceinstaller not installed`,
-etc. Result in `refresh.py`: `_record_failure(ipa,
+etc. — excluding the transient AFC transport errors carved out
+above. Result in `refresh.py`: `_record_failure(ipa,
 "install-failed", ...)`. **Bumps `consecutive_failures` by 1.**
 After 3 such failures, `is_frozen()` returns True and the IPA is
 skipped on subsequent ticks until something resets the counter

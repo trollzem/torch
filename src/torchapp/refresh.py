@@ -26,6 +26,7 @@ Three strikes and the IPA is frozen until the user intervenes.
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -356,6 +357,7 @@ def reconcile_devices(cfg: Config) -> Config:
             pymd3.TunnelNotFoundError,
             pymd3.LockdownError,
             pymd3.TunneldDownError,
+            subprocess.TimeoutExpired,
         ) as e:
             log.warning(
                 "could not reconcile device %s: %s",

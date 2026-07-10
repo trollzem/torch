@@ -103,6 +103,28 @@ _APP_CAP_ERR_RE = re.compile(
     re.DOTALL,
 )
 
+# ideviceinstaller errors that mean "the device dropped off Wi-Fi/USB
+# mid-operation," not "the IPA is broken":
+#   - AFC transport errors ("AFC Write error", "wrote only N of M")
+#     when the bulk transfer drops mid-stream. Confirmed 2026-07-09:
+#     "AFC Write error: 30" + "wrote only 0 of 1048576" froze
+#     YouTube-iOS.ipa for a week even though the very next retry
+#     succeeded instantly — the same transient-transfer failure mode
+#     the 240s-timeout path already treats as offline, just
+#     surfacing as a fast error instead of a hang.
+#   - "No device found with udid ..." when the pre-flight
+#     idevice_id -n Bonjour probe saw the device but it had already
+#     dropped off by the time ideviceinstaller actually connected —
+#     also confirmed 2026-07-09, same session, same IPA.
+# Treat both as DeviceOfflineError (soft, no strike) so a one-off
+# reachability blip doesn't require manual intervention to un-freeze.
+_TRANSIENT_IOS_ERR_RE = re.compile(
+    r"AFC (?:Write|Read) error"
+    r"|wrote only \d+ of \d+"
+    r"|No device found with udid",
+    re.IGNORECASE,
+)
+
 
 def tcp_probe(host: str, port: int, timeout: float = _TCP_PROBE_TIMEOUT) -> bool:
     """One-shot TCP handshake check against host:port.
@@ -303,6 +325,11 @@ def _install_ios(
         "Install: Complete" not in combined
         and "InstallComplete" not in combined
     ):
+        if _TRANSIENT_IOS_ERR_RE.search(combined):
+            raise DeviceOfflineError(
+                f"{device.name}: transient Wi-Fi/USB reachability "
+                f"error; retrying next cycle: {combined[-300:].strip()}"
+            )
         raise InstallFailedError(
             f"{device.name}: ideviceinstaller exit="
             f"{result.returncode}: {combined[-600:].strip() or 'no output'}"
