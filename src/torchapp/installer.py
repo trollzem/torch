@@ -116,12 +116,19 @@ _APP_CAP_ERR_RE = re.compile(
 #     idevice_id -n Bonjour probe saw the device but it had already
 #     dropped off by the time ideviceinstaller actually connected —
 #     also confirmed 2026-07-09, same session, same IPA.
-# Treat both as DeviceOfflineError (soft, no strike) so a one-off
+#   - "Device removed" when the device drops off mid-install, after
+#     the file copy already finished. Confirmed 2026-07-13: exit=0,
+#     copy reported DONE, install started, then "ideviceinstaller:
+#     Device removed" with no "Install: Complete" marker — froze
+#     YouTube-iOS.ipa for another full week since this exact wording
+#     wasn't covered by the first fix.
+# Treat all as DeviceOfflineError (soft, no strike) so a one-off
 # reachability blip doesn't require manual intervention to un-freeze.
 _TRANSIENT_IOS_ERR_RE = re.compile(
     r"AFC (?:Write|Read) error"
     r"|wrote only \d+ of \d+"
-    r"|No device found with udid",
+    r"|No device found with udid"
+    r"|Device removed",
     re.IGNORECASE,
 )
 

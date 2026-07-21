@@ -152,9 +152,19 @@ Raised when:
     -n` Bonjour probe saw the device, but it had already dropped
     off Wi-Fi by the time `ideviceinstaller` connected. Confirmed
     2026-07-09, same session/IPA, the iPad target.
+  - `Device removed` — the device drops off mid-install, *after*
+    the file copy already finished (exit=0, copy reported DONE,
+    then the install step never reaches "Install: Complete").
+    Confirmed 2026-07-13: this exact wording wasn't covered by the
+    first fix and froze `YouTube-iOS.ipa` for another full week
+    with zero retries in between.
 
-  `_TRANSIENT_IOS_ERR_RE` in `installer.py` recognizes both and
-  raises `DeviceOfflineError` instead of `InstallFailedError`.
+  `_TRANSIENT_IOS_ERR_RE` in `installer.py` recognizes all three and
+  raises `DeviceOfflineError` instead of `InstallFailedError`. Each
+  time a new disconnect wording surfaces in the wild, add it here
+  rather than broadening the match generically — see the file's
+  history for why (avoids masking genuine install errors as soft
+  failures).
 
 Result in `refresh.py`: `_record_soft_failure(ipa, "device-offline", ...)`
 or `"partial"` if some siblings succeeded. **Does not bump
