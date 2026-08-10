@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import installer, paths, plumesign, pymd3
-from .config import CertStatus, Config, Device, IPA
+from .config import CertStatus, Config, Device, IPA, Settings
 
 log = logging.getLogger(__name__)
 
@@ -120,14 +120,74 @@ def is_frozen(ipa: IPA) -> bool:
     return ipa.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
 
 
-# Free-tier profiles expire 7 days after install, per-device.
+# Fallback profile lifetime for IPAs whose embedded.mobileprovision
+# hasn't been parsed yet. Free-tier profiles expire 7 days after issue;
+# paid Developer Program profiles last 365. The real value comes from
+# the profile itself (ipa.profile_ttl_days) — see profile_lifetime().
 FREE_TIER_PROFILE_LIFETIME = timedelta(days=7)
+
+# A profile with a TTL at or above this is a paid Developer Program
+# profile, not a free Apple ID one. Apple issues 7-day profiles on the
+# free tier and 365-day ones on a paid membership, so anything past a
+# month is unambiguous. Used to skip free-tier-only restrictions (the
+# 3-apps-per-device cap) rather than trusting a stored account flag
+# that could go stale after an upgrade or lapse.
+PAID_TIER_TTL_THRESHOLD_DAYS = 30
+
+# How much of a profile's life to keep in reserve as retry runway.
+# Whichever is larger: 5% of the TTL, or MIN_REFRESH_SAFETY_DAYS. On a
+# 7-day free profile that yields 2 days (48 hourly retries — the
+# historical hardcoded 5-day cadence, preserved exactly). On a 365-day
+# paid profile it yields ~18 days, so we re-sign at ~day 347.
+REFRESH_SAFETY_FRACTION = 0.05
+MIN_REFRESH_SAFETY_DAYS = 2
 
 # Threshold for "this device is about to lose its profile and we
 # haven't been able to refresh it." 24h gives the user a full day
 # of warning during which a wake/charge of the device is plenty of
 # runway for the next refresh tick to catch them.
 DEVICE_EXPIRY_WARNING_HOURS = 24
+
+
+def profile_lifetime(ipa: IPA) -> timedelta:
+    """How long this IPA's provisioning profile stays valid.
+
+    Read from the profile itself (Apple's TimeToLive) when we've
+    signed it at least once since profile scraping was added; falls
+    back to the free-tier 7 days otherwise. Getting this from the
+    profile rather than a constant is what makes the whole app
+    account-tier aware — a paid membership issues 365-day profiles
+    and everything downstream (refresh cadence, expiry countdown,
+    the 3-app cap) keys off this one number.
+    """
+    ttl = ipa.profile_ttl_days
+    if ttl is None or ttl <= 0:
+        return FREE_TIER_PROFILE_LIFETIME
+    return timedelta(days=ttl)
+
+
+def is_paid_tier(ipa: IPA) -> bool:
+    """True if this IPA's last profile came from a paid membership."""
+    ttl = ipa.profile_ttl_days
+    return ttl is not None and ttl >= PAID_TIER_TTL_THRESHOLD_DAYS
+
+
+def effective_interval_days(ipa: IPA, settings: Settings) -> int:
+    """Refresh cadence for this IPA, derived from its profile TTL.
+
+    Keeps REFRESH_SAFETY_FRACTION of the profile's life (floored at
+    MIN_REFRESH_SAFETY_DAYS) as retry runway for devices that are
+    asleep or off-network when the cycle fires. Falls back to the
+    configured interval when we have no profile data yet.
+
+        7-day free profile   -> 5 days   (2 days / 48 hourly retries)
+        365-day paid profile -> 347 days (~18 days of runway)
+    """
+    ttl = ipa.profile_ttl_days
+    if ttl is None or ttl <= 0:
+        return settings.refresh_interval_days
+    safety = max(MIN_REFRESH_SAFETY_DAYS, round(ttl * REFRESH_SAFETY_FRACTION))
+    return max(1, ttl - safety)
 
 
 def device_expires_at(
@@ -140,6 +200,12 @@ def device_expires_at(
     IPA-wide `last_installed_at` for IPAs that haven't been
     refreshed since the per-device tracking was added. Returns
     None if we have no install record for this device at all.
+
+    The window added to that timestamp is the profile's real
+    lifetime, not a fixed 7 days — see profile_lifetime(). Install
+    time is a slightly late proxy for the profile's issue time (we
+    sign, then install seconds later), which is immaterial against
+    a safety margin measured in days.
     """
     iso = ipa.installs.get(pair_record_identifier) or ipa.last_installed_at
     if not iso:
@@ -147,7 +213,7 @@ def device_expires_at(
     parsed = _parse_iso(iso)
     if parsed is None:
         return None
-    return parsed + FREE_TIER_PROFILE_LIFETIME
+    return parsed + profile_lifetime(ipa)
 
 
 def device_expires_in_hours(
@@ -473,11 +539,16 @@ def refresh_one(
     cfg: Config,
     *,
     progress: ProgressCallback | None = None,
+    force: bool = False,
 ) -> bool:
     """Sign + install a single IPA. Returns True on success, False on failure.
 
     Callers must hold no lock; this function is designed to be called from
     refresh_all() which already owns _refresh_lock.
+
+    `force` (the manual "Refresh Now" path) reinstalls on every
+    compatible target. Scheduled runs leave already-current devices
+    alone — see _devices_needing_install.
     """
     def emit(msg: str) -> None:
         log.info("[%s] %s", ipa.filename, msg)
@@ -490,17 +561,40 @@ def refresh_one(
         emit("no compatible targets; skipping")
         return False
 
+    # Narrow to the devices whose install has actually aged out. A
+    # scheduled cycle gets here whenever *any* target is stale, so
+    # without this the healthy targets get needlessly reinstalled (and
+    # their running app killed) every single cycle.
+    if not force:
+        interval = effective_interval_days(ipa, cfg.settings)
+        needing = _devices_needing_install(ipa, compatible, interval)
+        if not needing:
+            emit("all targets already current; nothing to do")
+            _record_success(ipa)
+            return True
+        if len(needing) < len(compatible):
+            skipped = [
+                d.name for d in compatible if d not in needing
+            ]
+            emit(
+                f"skipping {', '.join(skipped)} (install still current); "
+                f"refreshing {', '.join(d.name for d in needing)}"
+            )
+        compatible = needing
+
     # Enforce the free Apple ID 3-apps-per-device cap. This is separate
     # from the 10-app-IDs-per-week team-level limit — it's a per-device
-    # ceiling on simultaneously-trusted free-signed apps. Filter out any
-    # device that would go over 3 if we installed this IPA. If ALL
-    # targets get filtered out, treat it as a soft failure with a
-    # distinct status so the user knows to remove something rather than
-    # chasing a different problem.
+    # ceiling on simultaneously-trusted free-signed apps. Paid Developer
+    # Program memberships have no such cap, so skip the check entirely
+    # once the profile TTL tells us we're on one; enforcing it there
+    # would block legitimate installs. Filter out any device that would
+    # go over 3 if we installed this IPA. If ALL targets get filtered
+    # out, treat it as a soft failure with a distinct status so the user
+    # knows to remove something rather than chasing a different problem.
     over_cap: list[str] = []
     within_cap: list[Device] = []
     for d in compatible:
-        if device_has_room(cfg, d, including=ipa):
+        if is_paid_tier(ipa) or device_has_room(cfg, d, including=ipa):
             within_cap.append(d)
         else:
             over_cap.append(d.name)
@@ -541,6 +635,28 @@ def refresh_one(
             force_tvos=force_tvos_flag(ipa.platform),
         )
         ipa.signed_bundle_id = _read_signed_bundle_id(signed_path)
+        # Record what Apple actually granted us. This is the input to
+        # the refresh cadence and the expiry countdown, so it has to be
+        # re-read on every sign rather than assumed: a membership that
+        # gets upgraded (7 -> 365) or lapses (365 -> 7) changes it, and
+        # both directions need to take effect on the next cycle.
+        profile_info = _read_profile_info(signed_path)
+        if profile_info is not None:
+            expires_iso, ttl_days = profile_info
+            changed = ttl_days != ipa.profile_ttl_days
+            ipa.profile_expires_at = expires_iso
+            ipa.profile_ttl_days = ttl_days
+            if changed:
+                tier = (
+                    "paid"
+                    if ttl_days >= PAID_TIER_TTL_THRESHOLD_DAYS
+                    else "free"
+                )
+                emit(
+                    f"provisioning profile TTL is {ttl_days}d ({tier} "
+                    f"tier); refresh cadence is now "
+                    f"{effective_interval_days(ipa, cfg.settings)}d"
+                )
     except plumesign.PlumesignNotLoggedInError as e:
         # Session expired / no account selected: user must re-login via
         # the menubar. Until they do, no retry succeeds. Treat this as
@@ -666,6 +782,91 @@ def refresh_one(
     return True
 
 
+def _read_profile_info(ipa_path: Path) -> tuple[str, int] | None:
+    """Return (expiration_date_iso, ttl_days) from the signed IPA's
+    embedded.mobileprovision, or None if it can't be read.
+
+    embedded.mobileprovision is a CMS/PKCS#7-signed blob wrapping an
+    XML plist. Rather than shelling out to `security cms -D` (which
+    would be a subprocess per sign, and pulls in the PYTHONHOME
+    scrubbing concerns documented in CLAUDE.md), we slice the plain
+    XML payload out of the DER envelope — it's stored uncompressed
+    between the usual plist delimiters. Best-effort by design: every
+    failure path returns None and the caller keeps its previous
+    profile snapshot rather than clobbering it with nulls.
+    """
+    import plistlib
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(ipa_path) as zf:
+            prof_name = next(
+                (
+                    n
+                    for n in zf.namelist()
+                    if n.startswith("Payload/")
+                    and n.endswith(".app/embedded.mobileprovision")
+                    and n.count("/") == 2
+                ),
+                None,
+            )
+            if not prof_name:
+                return None
+            blob = zf.read(prof_name)
+    except (zipfile.BadZipFile, KeyError, OSError):
+        return None
+
+    start = blob.find(b"<?xml")
+    end = blob.find(b"</plist>")
+    if start == -1 or end == -1:
+        return None
+    try:
+        prof = plistlib.loads(blob[start : end + len(b"</plist>")])
+    except (plistlib.InvalidFileException, ValueError):
+        return None
+
+    expires = prof.get("ExpirationDate")
+    ttl = prof.get("TimeToLive")
+    if not isinstance(expires, datetime) or not isinstance(ttl, int):
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires.astimezone(timezone.utc).isoformat(), ttl
+
+
+def _devices_needing_install(
+    ipa: IPA,
+    devices: list[Device],
+    interval_days: int,
+    now: datetime | None = None,
+) -> list[Device]:
+    """Subset of `devices` whose install is missing or older than the
+    refresh interval.
+
+    This is what keeps a chronically-offline target from dragging
+    healthy ones into a reinstall every cycle. any_target_device_stale()
+    fires the refresh when *any* target lags, but the install itself
+    must only touch the devices that actually lag — reinstalling on an
+    already-current device is pure downside: installd's pre-kill
+    (discovery #4) terminates the app mid-use, which is exactly how
+    YouTube ended up crashing hourly on the one reachable iPhone while
+    an asleep iPad and a second phone kept the IPA perpetually "stale".
+    """
+    if now is None:
+        now = _now()
+    threshold = timedelta(days=interval_days)
+    needing: list[Device] = []
+    for device in devices:
+        iso = ipa.installs.get(device.pair_record_identifier)
+        if iso is None:
+            needing.append(device)
+            continue
+        installed_at = _parse_iso(iso)
+        if installed_at is None or (now - installed_at) >= threshold:
+            needing.append(device)
+    return needing
+
+
 def _read_signed_bundle_id(ipa_path: Path) -> str | None:
     """Read CFBundleIdentifier from the signed IPA's Info.plist."""
     import plistlib
@@ -771,7 +972,6 @@ def _refresh_all_locked(
     emit("reconciling devices against tunneld")
     cfg = reconcile_devices(cfg)
 
-    interval = cfg.settings.refresh_interval_days
     only_set = set(only) if only is not None else None
     candidates = [
         ipa
@@ -780,8 +980,13 @@ def _refresh_all_locked(
         and not is_frozen(ipa)
         and (
             force
-            or needs_refresh(ipa, interval)
-            or any_target_device_stale(ipa, cfg, interval)
+            # Interval is per-IPA because it's derived from that IPA's
+            # own provisioning profile TTL, which differs by account
+            # tier (and can differ between IPAs mid-migration).
+            or needs_refresh(ipa, effective_interval_days(ipa, cfg.settings))
+            or any_target_device_stale(
+                ipa, cfg, effective_interval_days(ipa, cfg.settings)
+            )
         )
     ]
     if not candidates:
@@ -795,7 +1000,7 @@ def _refresh_all_locked(
     try:
         for ipa in candidates:
             try:
-                ok = refresh_one(ipa, cfg, progress=progress)
+                ok = refresh_one(ipa, cfg, progress=progress, force=force)
             except RefreshAborted:
                 # Whole-run abort — stop processing further IPAs but save
                 # whatever we managed to record on the current one.

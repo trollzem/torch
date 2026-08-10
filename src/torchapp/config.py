@@ -7,7 +7,7 @@ import json
 import logging
 import plistlib
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -73,12 +73,31 @@ class IPA:
     # surfaced a notification for this device's profile expiring.
     # Dedupes notifications to once per UTC day per (ipa, device).
     expiry_notified: dict[str, str] = field(default_factory=dict)
+    # Provisioning-profile facts scraped from the signed IPA's
+    # embedded.mobileprovision after every successful sign. Apple's
+    # TimeToLive is 7 days on a free Apple ID and 365 days on a paid
+    # Developer Program membership, so this is the single source of
+    # truth for both the refresh cadence and the per-device expiry
+    # countdown -- see refresh.effective_interval_days() and
+    # refresh.profile_lifetime(). Before 2026-08-10 both were derived
+    # from a hardcoded 7-day constant, which meant upgrading to a paid
+    # account left Torch re-signing ~73x more often than needed.
+    # None on IPAs that haven't been signed since this was added.
+    profile_expires_at: str | None = None
+    profile_ttl_days: int | None = None
 
 
 @dataclass
 class Settings:
-    # 5-day cadence (not 6) gives us 48 hourly retry attempts before the
-    # 7-day free-tier profile expires. The reason: iOS devices have
+    # Fallback cadence, used only for IPAs with no parsed provisioning
+    # profile yet (never signed since profile_ttl_days was added). The
+    # real cadence is derived per-IPA from the profile's own TimeToLive
+    # by refresh.effective_interval_days(), which reproduces this 5-day
+    # value for a 7-day free-tier profile and stretches to ~347 days on
+    # a 365-day paid-membership profile.
+    #
+    # Why 5 and not 6 for the free tier: it leaves 48 hourly retry
+    # attempts before the 7-day profile expires. iOS devices have
     # aggressive Wi-Fi power-save — the iPhone/iPad can be unreachable
     # for stretches of minutes-to-hours at a time even when "awake and
     # on Wi-Fi". A single refresh attempt can legitimately find every
@@ -135,12 +154,32 @@ class Config:
         tmp.write_text(json.dumps(asdict(self), indent=2, default=str))
         tmp.replace(paths.CONFIG_FILE)
 
+    @staticmethod
+    def _known_fields(cls_: type, raw: dict) -> dict:
+        """Drop keys the dataclass doesn't declare.
+
+        `Cls(**raw)` raises TypeError on any unexpected key, which makes
+        config.json a one-way door: a newer Torch adds a field, and an
+        older bundle reading the same file dies on every load instead of
+        ignoring what it doesn't understand. Hit for real on 2026-08-10
+        when `profile_expires_at` landed while the previous build was
+        still running — its config watcher threw on every tick. Unknown
+        keys are dropped rather than preserved: they'd be lost on the
+        next save() anyway, and silently round-tripping fields this
+        version can't reason about is worse than forgetting them.
+        """
+        allowed = {f.name for f in fields(cls_)}
+        return {k: v for k, v in raw.items() if k in allowed}
+
     @classmethod
     def _from_dict(cls, data: dict) -> Config:
-        devices = [Device(**d) for d in data.get("devices", [])]
-        ipas = [IPA(**i) for i in data.get("ipas", [])]
-        settings = Settings(**data.get("settings", {}))
-        cert_status = CertStatus(**data.get("cert_status", {}))
+        kf = cls._known_fields
+        devices = [Device(**kf(Device, d)) for d in data.get("devices", [])]
+        ipas = [IPA(**kf(IPA, i)) for i in data.get("ipas", [])]
+        settings = Settings(**kf(Settings, data.get("settings", {})))
+        cert_status = CertStatus(
+            **kf(CertStatus, data.get("cert_status", {}))
+        )
         return cls(
             version=data.get("version", CONFIG_VERSION),
             apple_id_email=data.get("apple_id_email"),

@@ -27,32 +27,86 @@ It runs on three triggers, all of which converge on `refresh_all`:
   (`ui.on_refresh_now`). Same code path, force=True so the
   needs_refresh predicate is bypassed.
 
-## The 5-day refresh interval
+## The refresh interval is derived, not configured
+
+The cadence comes from the provisioning profile's own
+`TimeToLive`, read out of `embedded.mobileprovision` after every
+sign and cached on the IPA as `profile_ttl_days` /
+`profile_expires_at`. Apple issues **7-day** profiles on a free
+Apple ID and **365-day** profiles on a paid Developer Program
+membership, so the tier is self-evident from the artifact and
+never has to be configured or guessed.
 
 ```python
-refresh_interval_days: int = 5  # default in Settings
+def effective_interval_days(ipa: IPA, settings: Settings) -> int:
+    ttl = ipa.profile_ttl_days
+    if ttl is None or ttl <= 0:
+        return settings.refresh_interval_days   # fallback, never signed yet
+    safety = max(MIN_REFRESH_SAFETY_DAYS, round(ttl * REFRESH_SAFETY_FRACTION))
+    return max(1, ttl - safety)
 ```
 
-Apple's free-tier provisioning profile lifetime is 7 days from
-the moment the profile is issued (which is also the moment we
-sign the IPA). We re-sign on a 5-day cadence, leaving a 2-day
-tail for retries. With the hourly tick, that's **48 retry
-attempts** before any IPA hits actual expiry — enough to tolerate
-iOS Wi-Fi power-save making targets intermittently unreachable
-for hours at a time.
+The reserve is `max(5% of TTL, 2 days)`, which reproduces the
+historical free-tier behaviour exactly and scales sanely upward:
+
+| Tier | Profile TTL | Reserve | Refresh at | Hourly retries in reserve |
+|------|-------------|---------|------------|---------------------------|
+| Free | 7 days      | 2 days  | day 5      | 48                        |
+| Paid | 365 days    | 18 days | day 347    | 432                       |
 
 ```
-Day 0    Day 5         Day 7
+Day 0    Day 5         Day 7          (free tier)
 |--------|--------------|-->
 sign     refresh_due    profile expires
          |
          |--- 48 hourly retries ---|
 ```
 
-The interval is in `config.py:Settings.refresh_interval_days`
-(default 5). Users can override it in `config.json` if they want
-a different runway; the historical default was 6 until 2026-04-19,
-when iOS Wi-Fi variance forced us to widen the retry window.
+`Settings.refresh_interval_days` (default 5) is now only a
+fallback for IPAs with no parsed profile yet — a freshly added
+IPA signs immediately anyway (`last_signed_at is None`), so in
+practice it rarely applies.
+
+**Why this is derived rather than a setting.** Until 2026-08-10
+the 7-day lifetime was hardcoded in three places (the cadence,
+`device_expires_at`, and the 3-app cap). Upgrading the Apple ID
+to a paid membership therefore left Torch re-signing every 5 days
+against a 365-day profile — ~73x more often than needed — and,
+combined with the all-targets install bug below, reinstalled
+YouTube on the one reachable iPhone **every hour**, killing the
+app mid-use each time via the installd pre-kill. Deriving from
+the artifact means an upgrade *or* a lapse takes effect on the
+next sign with no user action.
+
+## Only stale devices get reinstalled
+
+`any_target_device_stale()` fires the refresh when **any** target
+lags, but `refresh_one()` must only install to the targets that
+actually lag — `_devices_needing_install()` filters to devices
+whose install is missing or older than the effective interval.
+
+This split matters because the trigger is per-device while the
+action used to be all-devices: one chronically-offline target
+(an asleep iPad, a second phone) kept an IPA permanently "stale",
+so every cycle re-signed and reinstalled on the healthy targets
+too. Each of those reinstalls runs the DVT pre-kill
+(`docs/install.md`, CLAUDE.md discovery #4), which terminates the
+running app — the user-visible symptom was YouTube crashing
+hourly, mid-video, on the only phone that was working.
+
+`force=True` (the manual "Refresh Now" path) bypasses the filter
+and reinstalls everywhere, which is what a user pressing that
+button means.
+
+## Free-tier-only restrictions
+
+`FREE_TIER_DEVICE_APP_CAP = 3` applies to free Apple IDs only;
+paid memberships have no per-device app ceiling. `refresh_one()`
+skips the cap check entirely when `is_paid_tier(ipa)` — i.e. when
+the profile TTL is at or above `PAID_TIER_TTL_THRESHOLD_DAYS`
+(30). Gating on the observed TTL rather than a stored account
+flag means the restriction re-arms automatically if a membership
+lapses back to free.
 
 ## needs_refresh and is_frozen
 

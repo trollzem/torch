@@ -133,9 +133,12 @@ HOURLY_TICK_SECONDS = 3600.0
 # config.json edits from another process). Cheap on-disk I/O only.
 CONFIG_WATCH_SECONDS = 5.0
 
-# Free Apple ID provisioning profiles live for 7 days from the moment
-# the profile is issued (which is also the moment we sign the IPA).
-FREE_TIER_PROFILE_LIFETIME = timedelta(days=7)
+# Fallback only. The real per-IPA lifetime comes from the signed
+# profile's TimeToLive via refresh.profile_lifetime() -- 7 days on a
+# free Apple ID, 365 on a paid membership. Never assume 7 here: doing
+# so rendered every app as long-"expired" in the menubar once the
+# account went paid.
+FALLBACK_PROFILE_LIFETIME = timedelta(days=7)
 
 
 def _format_age(iso: str | None) -> str:
@@ -208,14 +211,16 @@ def _pick_ipa_files() -> list[Path]:
     return [Path(str(url.path())) for url in panel.URLs()]
 
 
-def _format_expiry(iso: str | None) -> str:
+def _format_expiry(iso: str | None, lifetime: timedelta | None = None) -> str:
     """Human-friendly time until profile expiry.
 
-    Profile expires 7 days after last_signed_at. Returns strings like:
+    `lifetime` is the IPA's real profile lifetime (see
+    refresh.profile_lifetime); falls back to the free-tier 7 days when
+    the caller has nothing better. Returns strings like:
       - "not signed yet"  (never signed)
       - "6d 23h left"     (> 24 hours remaining)
       - "5h 12m left"     (< 24 hours remaining)
-      - "expired"         (past the 7-day mark)
+      - "expired"         (past expiry)
     """
     if not iso:
         return "not signed yet"
@@ -223,7 +228,7 @@ def _format_expiry(iso: str | None) -> str:
         signed_at = datetime.fromisoformat(iso)
     except ValueError:
         return "unknown"
-    expires_at = signed_at + FREE_TIER_PROFILE_LIFETIME
+    expires_at = signed_at + (lifetime or FALLBACK_PROFILE_LIFETIME)
     delta = expires_at - datetime.now(timezone.utc)
     if delta.total_seconds() <= 0:
         return "expired"
@@ -603,7 +608,8 @@ class TorchApp(rumps.App):
                 }.get(ipa.status, "·")
                 label = (
                     f"{status_icon} {Path(ipa.filename).stem} · "
-                    f"{ipa.platform} · {_format_expiry(ipa.last_signed_at)}"
+                    f"{ipa.platform} · "
+                    f"{_format_expiry(ipa.last_signed_at, refresh.profile_lifetime(ipa))}"
                 )
                 ipa_parent = rumps.MenuItem(label)
 

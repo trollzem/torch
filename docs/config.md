@@ -54,10 +54,15 @@ class IPA:
     status: str = "pending"                         # see status taxonomy
     consecutive_failures: int = 0
     last_error: str | None = None
+    installs: dict[str, str] = {}                   # pair_record_id -> ISO install time
+    expiry_notified: dict[str, str] = {}            # pair_record_id -> ISO date warned
+    profile_expires_at: str | None = None           # from embedded.mobileprovision
+    profile_ttl_days: int | None = None             # 7 = free tier, 365 = paid
 
 @dataclass
 class Settings:
-    refresh_interval_days: int = 5                  # 2-day retry tail before 7d expiry
+    refresh_interval_days: int = 5                  # FALLBACK only; real cadence is
+                                                    # derived from profile_ttl_days
     auto_refresh_paused: bool = False
     start_at_login: bool = True
 
@@ -102,6 +107,31 @@ interleave and corrupt the JSON. The race window is small but
 real -- the iOS auto-detect saves immediately after appending a
 new device, and the refresh cycle saves at the end. Atomic
 rename guarantees readers always see a complete, valid file.
+
+## Tolerant load (`_known_fields`)
+
+`_from_dict` filters every raw dict down to the keys its
+dataclass actually declares before constructing it:
+
+```python
+allowed = {f.name for f in fields(cls_)}
+return {k: v for k, v in raw.items() if k in allowed}
+```
+
+Plain `Cls(**raw)` raises `TypeError` on any unexpected key,
+which turns config.json into a one-way door: the moment a newer
+Torch writes a new field, an older bundle reading the same file
+dies on **every** load. That happened for real on 2026-08-10 —
+`profile_expires_at` was written while the previous build was
+still running, and its config-watcher tick threw on each fire
+until the new bundle landed.
+
+Unknown keys are dropped, not preserved. They'd be lost on the
+next `save()` regardless (which serializes from the dataclass),
+and silently round-tripping fields this version can't reason
+about is worse than forgetting them. Adding a field is therefore
+always safe; **renaming or repurposing** one still needs a real
+migration.
 
 ## sync_ipas_folder
 
