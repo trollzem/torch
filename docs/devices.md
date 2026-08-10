@@ -18,7 +18,9 @@ that the refresh loop can target." Three flows feed it:
 1. **tvOS pairing** (user-driven, PIN-based) — runs once per Apple TV.
 2. **iOS / iPadOS auto-detect** (background, 5s polling tick) —
    picks up devices the moment they're USB-trusted via a Bonjour
-   path.
+   path. Discovered devices land with
+   `approved_for_install = False` and receive nothing until the
+   user ticks them for an app — see "Discovery is not consent".
 3. **Periodic reconciliation** — every refresh cycle re-asks tunneld
    for the device's current name / product type / OS version.
 
@@ -164,19 +166,42 @@ Flow:
      explicit pairing path to handle.
    - Re-check `cfg.device_by_pair_record(pid)` to defend against
      races between the worker and the tvOS post-pair path.
-   - Append the device to `cfg.devices` in place.
-   - For each tracked IPA, if `is_compatible(ipa.platform,
-     device.device_class)`, append `pid` to `ipa.target_devices`.
-   - `cfg.save()` (atomic temp+rename) before attempting the
-     slow Apple portal call. If `register_device` hangs or fails,
-     the device is already persisted and the next refresh will
-     retry registration.
+   - Set `approved_for_install = False` and append the device to
+     `cfg.devices` in place.
+   - `cfg.save()` (atomic temp+rename).
 5. Notify the user via `_notify_async`. Rebuild the menu via
    `_rebuild_async`. Reset the in-flight flag.
 
 The menubar item "Check for new iPhones/iPads now" just kicks
 this same worker immediately rather than waiting for the next 5s
 tick.
+
+### Discovery is not consent
+
+**Auto-detect adds a device to the inventory and stops there.** It
+does not target the device with any IPA, and it does not register
+the UDID with Apple. Both of those wait for the user to tick the
+device under some app's "Install on devices" submenu, which flips
+`approved_for_install` (`ui._toggle_target`) and lets
+`config._make_ipa_entry` auto-target it for IPAs added later.
+Registration then happens naturally at
+`refresh._ensure_devices_registered()`, immediately before the
+first real install.
+
+This matters because *anything a person plugs into this Mac and
+taps "Trust" on lands in tunneld* — a houseguest charging their
+phone is indistinguishable from the owner's new iPhone at this
+layer. Until 2026-08-10 the worker appended each discovery to
+`target_devices` of every compatible IPA and registered it with
+Apple immediately, so a guest phone silently received sideloaded
+apps on the next refresh and consumed one of the account's device
+slots (which only reset once per membership year). Three separate
+phones were auto-added this way between 2026-06-20 and
+2026-06-29, and one of them had YouTube installed on it.
+
+If you are tempted to restore auto-targeting for convenience:
+don't. The cost of a missed tick is one click; the cost of a
+false positive is installing software on someone else's phone.
 
 ## reconcile_device
 

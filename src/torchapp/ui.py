@@ -452,14 +452,24 @@ class TorchApp(rumps.App):
                 if self.cfg.device_by_pair_record(pid) is not None:
                     continue
 
-                # Persist BEFORE the slow Apple portal call so a
-                # plumesign hang doesn't lose the in-memory add.
+                # Discovered, not trusted. Anything that appears in
+                # tunneld got there because someone plugged a phone into
+                # this Mac and tapped Trust — that is not consent to
+                # sideload onto it. So we record the device and stop:
+                # no IPA targeting, no Apple portal registration. It
+                # shows up unticked in every compatible IPA's "Install
+                # on devices" submenu, and ticking it there is the
+                # explicit approval (see _toggle_target).
+                #
+                # Until 2026-08-10 this block appended the device to
+                # target_devices of every compatible IPA *and*
+                # registered its UDID with Apple. A guest phone
+                # therefore silently received sideloaded apps on the
+                # next refresh and burned one of the account's device
+                # slots. The log shows three separate phones auto-added
+                # this way between 2026-06-20 and 2026-06-29.
+                reconciled.approved_for_install = False
                 self.cfg.devices.append(reconciled)
-                for ipa in self.cfg.ipas:
-                    if (refresh.is_compatible(
-                            ipa.platform, reconciled.device_class)
-                            and pid not in ipa.target_devices):
-                        ipa.target_devices.append(pid)
                 try:
                     self.cfg.save()
                 except OSError as e:
@@ -471,36 +481,33 @@ class TorchApp(rumps.App):
                 self._last_config_mtime = self._config_mtime()
 
                 log.info(
-                    "auto-detect: added %s (%s, %s)",
+                    "auto-detect: discovered %s (%s, %s) — not targeted "
+                    "by any IPA and not registered with Apple until "
+                    "explicitly enabled",
                     reconciled.name,
                     reconciled.device_class,
                     reconciled.product_type,
                 )
                 added.append(reconciled)
 
-                # Best-effort Apple portal registration. Broad except:
-                # subprocess.TimeoutExpired, UnicodeDecodeError, network
-                # — none of them should lose the saved device.
-                if reconciled.udid:
-                    try:
-                        plumesign.register_device(
-                            reconciled.udid, reconciled.name
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        log.warning(
-                            "auto-detect: register_device failed for "
-                            "%s (will retry next refresh): %s",
-                            reconciled.udid, e,
-                        )
+            # Apple portal registration deliberately does NOT happen
+            # here. refresh._ensure_devices_registered() registers a
+            # device right before its first real install, which is the
+            # first moment the UDID needs to exist on the account —
+            # registering at discovery time spent a device slot on
+            # every phone that was ever plugged in, and slots only
+            # reset once per membership year.
 
             if added:
                 self._rebuild_async()
                 for d in added:
                     self._notify_async(
                         "Torch",
-                        "Device added",
-                        f"{d.name} ({d.device_class}) detected and "
-                        f"added to Torch.",
+                        "New device detected",
+                        f"{d.name} ({d.device_class}) is visible to "
+                        f"Torch but will not receive any apps. Enable "
+                        f"it under an app's 'Install on devices' menu "
+                        f"if you want it to.",
                     )
         except Exception as e:  # noqa: BLE001
             log.exception("auto-detect worker crashed: %s", e)
@@ -947,6 +954,17 @@ class TorchApp(rumps.App):
                 pair_record_identifier,
                 ipa_filename,
             )
+            # Ticking a device here is the user explicitly vouching for
+            # it, which is exactly the approval an auto-detected device
+            # is waiting on. Flip the flag so IPAs added later can
+            # auto-target it like any explicitly paired device.
+            device = self.cfg.device_by_pair_record(pair_record_identifier)
+            if device is not None and not device.approved_for_install:
+                device.approved_for_install = True
+                log.info(
+                    "approved auto-detected device %s for install",
+                    pair_record_identifier,
+                )
         self.cfg.save()
         self._last_config_mtime = self._config_mtime()
         self._rebuild()

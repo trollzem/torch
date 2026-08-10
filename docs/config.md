@@ -39,6 +39,8 @@ class Device:
     pair_record_path: str | None = None
     product_type: str | None = None                 # "AppleTV14,1"
     product_version: str | None = None              # "26.4"
+    approved_for_install: bool = True               # False for auto-detected
+                                                    # devices until user opts in
 
 @dataclass
 class IPA:

@@ -38,6 +38,15 @@ class Device:
     pair_record_path: str | None = None
     product_type: str | None = None     # e.g. "AppleTV14,1"
     product_version: str | None = None  # e.g. "26.4"
+    # Whether this device may be auto-targeted by newly added IPAs.
+    # True for devices the user explicitly paired or explicitly ticked
+    # for an IPA; False for ones the tunneld auto-detect worker found on
+    # its own. Anyone who plugs an iPhone into this Mac and taps Trust
+    # shows up in tunneld, so auto-detected devices must not silently
+    # start receiving sideloaded apps — see ui._auto_detect_ios_worker.
+    # Defaults True so existing configs and explicit pairings are
+    # unaffected by the field being added.
+    approved_for_install: bool = True
 
 
 @dataclass
@@ -404,11 +413,17 @@ def platform_matches_device(ipa_platform: str, device_class: str) -> bool:
 def _make_ipa_entry(ipa_file: Path, devices: list[Device]) -> IPA | None:
     """Create a new IPA entry for a freshly discovered file.
 
-    Auto-targets every platform-compatible device. tvOS IPAs only target
-    Apple TVs; iOS/iPadOS IPAs only target iPhones/iPads. Earlier versions
-    targeted every device and relied on the refresh-time platform filter,
-    but that left iPhones in tvOS IPAs' target lists, which confused both
-    the UI and anyone reading config.json.
+    Auto-targets every platform-compatible device that is approved for
+    install. tvOS IPAs only target Apple TVs; iOS/iPadOS IPAs only
+    target iPhones/iPads. Earlier versions targeted every device and
+    relied on the refresh-time platform filter, but that left iPhones
+    in tvOS IPAs' target lists, which confused both the UI and anyone
+    reading config.json.
+
+    The approval check keeps a guest phone that the auto-detect worker
+    picked up off the target list of every IPA added afterwards. It
+    still shows in the per-IPA "Install on devices" submenu, unticked,
+    so opting it in stays one click away.
     """
     try:
         platform, bundle_id = _detect_ipa_platform(ipa_file)
@@ -425,6 +440,7 @@ def _make_ipa_entry(ipa_file: Path, devices: list[Device]) -> IPA | None:
             d.pair_record_identifier
             for d in devices
             if platform_matches_device(platform, d.device_class)
+            and d.approved_for_install
         ],
     )
 
